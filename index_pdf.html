@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DART 감사보고서 본문검색</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            navy: { 50:'#f0f4f8',100:'#d9e2ec',200:'#bcccdc',300:'#9fb3c8',400:'#829ab1',500:'#627d98',600:'#486581',700:'#334e68',800:'#243b53',900:'#102a43' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap');
+    body { font-family: 'Noto Sans KR', sans-serif; }
+    .highlight-keyword { background: #fef08a; padding: 1px 2px; border-radius: 2px; font-weight: 500; }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .modal-backdrop { backdrop-filter: blur(4px); }
+    .result-row:hover { background-color: #f8fafc; }
+    .result-row.hidden-by-filter { display: none; }
+    .result-row.hidden-by-rpt { display: none; }
+    .badge { display:inline-block; padding:1px 6px; border-radius:9999px; font-size:11px; font-weight:500; }
+    .badge-blue { background:#dbeafe; color:#1e40af; }
+    .badge-green { background:#dcfce7; color:#166534; }
+    .badge-gray { background:#f3f4f6; color:#4b5563; }
+    .badge-orange { background:#ffedd5; color:#9a3412; }
+    .auditor-tag { cursor:pointer; transition: all 0.15s; }
+    .auditor-tag:hover { transform: scale(1.05); }
+    .auditor-tag.active { box-shadow: 0 0 0 2px #3b82f6; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+  <!-- Header -->
+  <header class="bg-navy-800 text-white shadow-lg">
+    <div class="max-w-7xl mx-auto px-4 py-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h1 class="text-xl font-bold tracking-tight">DART 감사보고서 본문검색</h1>
+          <p class="text-navy-300 text-sm mt-0.5">감사보고서 내 키워드 검색 &amp; 감사인별 필터링</p>
+        </div>
+        <div class="text-navy-300 text-xs">
+          <span id="statusDot" class="inline-block w-2 h-2 rounded-full bg-gray-400 mr-1"></span>
+          <span id="statusText">서버 확인 중...</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Search Section -->
+  <section class="bg-white border-b shadow-sm">
+    <div class="max-w-7xl mx-auto px-4 py-5">
+      <!-- Keyword Search (Primary) -->
+      <div class="flex gap-3 items-end">
+        <div class="flex-1">
+          <label class="block text-sm font-medium text-gray-700 mb-1">본문 검색어</label>
+          <div class="relative">
+            <input id="keywordInput" type="text" placeholder="본문 키워드 (선택) — 비워두고 회사명만 입력하면 공시목록 조회"
+                   class="w-full px-4 py-2.5 pr-10 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                   autocomplete="off">
+            <svg class="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+            </svg>
+          </div>
+        </div>
+        <button id="searchBtn" onclick="doSearch(1)"
+                class="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors whitespace-nowrap">
+          검색
+        </button>
+      </div>
+
+      <!-- Filters Row -->
+      <div class="mt-3 flex flex-wrap gap-4 items-end">
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">시작일</label>
+          <input id="startDate" type="date" class="px-3 py-1.5 border border-gray-300 rounded text-sm focus:ring-1 focus:ring-blue-500 outline-none">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">종료일</label>
+          <input id="endDate" type="date" class="px-3 py-1.5 border border-gray-300 rounded text-sm focus:ring-1 focus:ring-blue-500 outline-none">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">공시유형</label>
+          <div class="flex gap-2">
+            <label class="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" id="dspA" value="A" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+              <span>정기공시</span>
+            </label>
+            <label class="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" id="dspF" value="F" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+              <span>외부감사</span>
+            </label>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">보고서 유형</label>
+          <div class="flex gap-2 flex-wrap">
+            <label class="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" id="rptAudit" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" onchange="applyReportTypeFilter()">
+              <span>감사보고서</span>
+            </label>
+            <label class="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" id="rptBiz" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" onchange="applyReportTypeFilter()">
+              <span>사업보고서</span>
+            </label>
+            <label class="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" id="rptHalf" checked class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" onchange="applyReportTypeFilter()">
+              <span>분·반기보고서</span>
+            </label>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">회사명 (선택)</label>
+          <input id="corpNameInput" type="text" placeholder="회사명"
+                 class="px-3 py-1.5 border border-gray-300 rounded text-sm w-40 focus:ring-1 focus:ring-blue-500 outline-none">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">감사인명 (필터)</label>
+          <div class="relative">
+            <input id="auditorNameInput" type="text" placeholder="예: 삼일회계법인"
+                   class="px-3 py-1.5 pr-7 border border-gray-300 rounded text-sm w-48 focus:ring-1 focus:ring-blue-500 outline-none">
+            <button id="auditorClearBtn" onclick="clearAuditorInput()" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 hidden" title="초기화">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">결과 수</label>
+          <select id="maxResults" class="px-3 py-1.5 border border-gray-300 rounded text-sm focus:ring-1 focus:ring-blue-500 outline-none">
+            <option value="15">15건</option>
+            <option value="30">30건</option>
+            <option value="50">50건</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main Content -->
+  <main class="max-w-7xl mx-auto px-4 py-5">
+    <!-- Status Bar -->
+    <div id="statusBar" class="hidden mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <span id="totalCount" class="text-sm text-gray-600"></span>
+        <span id="pageInfo" class="text-xs text-gray-400"></span>
+        <span id="filterInfo" class="text-xs text-blue-600 hidden"></span>
+        <span id="auditorPendingNotice" class="text-xs text-amber-600 hidden">⏳ 감사인명 확인 중입니다. 추출 완료 후 결과가 표시될 수 있습니다.</span>
+      </div>
+      <div id="auditorExtractStatus" class="text-xs text-gray-500 hidden">
+        <svg class="inline w-3 h-3 spin mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        <span id="extractStatusText">감사인 추출 중...</span>
+      </div>
+    </div>
+
+    <!-- Corp Name Warning -->
+    <div id="corpWarning" class="hidden mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+      <strong>주의:</strong> <span id="corpWarningText"></span>
+    </div>
+
+    <!-- Auditor Tags (supplementary) -->
+    <div id="auditorFilter" class="hidden mb-4 p-3 bg-white rounded-lg border">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-sm font-medium text-gray-700">감사인 목록</span>
+        <span class="text-xs text-gray-400">(클릭하면 필터 입력란에 자동 입력됩니다)</span>
+        <button onclick="clearAuditorFilter()" class="text-xs text-blue-600 hover:underline ml-auto">(전체보기)</button>
+      </div>
+      <div id="auditorTags" class="flex flex-wrap gap-1.5"></div>
+    </div>
+
+    <!-- Loading State -->
+    <div id="loadingState" class="hidden text-center py-16">
+      <svg class="w-10 h-10 mx-auto text-blue-500 spin mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+      </svg>
+      <p class="text-gray-500 text-sm">DART 본문검색 중...</p>
+      <p class="text-gray-400 text-xs mt-1">검색 기간이 길면 시간이 걸릴 수 있습니다</p>
+    </div>
+
+    <!-- Empty State -->
+    <div id="emptyState" class="text-center py-16">
+      <svg class="w-16 h-16 mx-auto text-gray-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+      </svg>
+      <p class="text-gray-400 text-sm">키워드 또는 회사명을 입력하여 검색하세요</p>
+      <p class="text-gray-300 text-xs mt-1">키워드 예: 운용리스, 수익인식 / 회사명만 입력하면 공시 목록이 조회됩니다</p>
+    </div>
+
+    <!-- Results Table -->
+    <div id="resultsArea" class="hidden">
+      <div class="bg-white rounded-lg border overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="bg-gray-50 border-b">
+              <tr>
+                <th class="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase w-10">#</th>
+                <th class="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase">접수일</th>
+                <th class="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase">시장</th>
+                <th class="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase">공시대상회사</th>
+                <th class="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase">보고서명</th>
+                <th class="px-3 py-2.5 text-left text-xs font-medium text-gray-500 uppercase">감사인</th>
+                <th class="px-3 py-2.5 text-center text-xs font-medium text-gray-500 uppercase w-16">원문</th>
+              </tr>
+            </thead>
+            <tbody id="resultsBody" class="divide-y divide-gray-100"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Pagination -->
+      <div id="pagination" class="flex items-center justify-center gap-2 mt-4"></div>
+    </div>
+
+    <!-- No Results -->
+    <div id="noResults" class="hidden text-center py-16">
+      <p class="text-gray-400 text-sm">검색 결과가 없습니다.</p>
+    </div>
+
+    <!-- Error State -->
+    <div id="errorState" class="hidden text-center py-16">
+      <svg class="w-12 h-12 mx-auto text-red-300 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+      </svg>
+      <p class="text-red-500 text-sm font-medium" id="errorMessage"></p>
+      <p class="text-gray-400 text-xs mt-2" id="errorHint"></p>
+      <button id="retryBtn" onclick="doSearch(currentPage)" class="hidden mt-4 px-5 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
+        다시 시도
+      </button>
+    </div>
+
+    <!-- Server Not Connected -->
+    <div id="serverError" class="hidden text-center py-16">
+      <svg class="w-16 h-16 mx-auto text-orange-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01M5.07 19H19a2 2 0 001.73-3L13.73 4a2 2 0 00-3.46 0L3.34 16A2 2 0 005.07 19z"/>
+      </svg>
+      <p class="text-orange-600 text-base font-semibold mb-2">서버에 연결할 수 없습니다</p>
+      <div class="text-gray-500 text-sm space-y-1">
+        <p>아래 단계를 확인해주세요:</p>
+        <div class="inline-block text-left mt-3 bg-gray-50 rounded-lg p-4 text-xs space-y-2">
+          <p><strong>1.</strong> 명령 프롬프트(cmd)를 열고 프로젝트 폴더로 이동합니다</p>
+          <p><strong>2.</strong> <code class="bg-gray-200 px-2 py-0.5 rounded">python app.py</code> 를 실행합니다</p>
+          <p><strong>3.</strong> "Running on http://127.0.0.1:5000" 메시지가 나타나면</p>
+          <p><strong>4.</strong> 브라우저에서 <a href="http://localhost:5000" class="text-blue-600 underline font-medium">http://localhost:5000</a> 으로 접속합니다</p>
+        </div>
+        <p class="mt-3 text-xs text-gray-400">현재 페이지 URL: <code id="currentUrl" class="bg-gray-100 px-1 rounded"></code></p>
+      </div>
+      <button onclick="checkServerHealth()" class="mt-4 px-5 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
+        연결 다시 확인
+      </button>
+    </div>
+  </main>
+
+
+  <script>
+    const API_BASE = '/api';
+    const FETCH_TIMEOUT = 120000;
+    let currentPage = 1;
+    let totalPages = 0;
+    let lastSearchData = null;
+    let currentResults = [];
+    let allAuditors = {};
+    let activeAuditorFilter = null;
+    let searchAbortController = null;
+    let serverConnected = false;
+
+    // ── 초기화 ──
+    document.addEventListener('DOMContentLoaded', () => {
+      const now = new Date();
+      const threeYearsAgo = new Date(now);
+      threeYearsAgo.setFullYear(now.getFullYear() - 3);
+      document.getElementById('startDate').value = formatDateInput(threeYearsAgo);
+      document.getElementById('endDate').value = formatDateInput(now);
+
+      document.getElementById('keywordInput').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') doSearch(1);
+      });
+      document.getElementById('corpNameInput').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') doSearch(1);
+      });
+
+      const auditorInput = document.getElementById('auditorNameInput');
+      auditorInput.addEventListener('input', () => {
+        const clearBtn = document.getElementById('auditorClearBtn');
+        if (auditorInput.value.trim()) {
+          clearBtn.classList.remove('hidden');
+        } else {
+          clearBtn.classList.add('hidden');
+        }
+        applyAuditorFilter();
+      });
+
+      document.getElementById('currentUrl').textContent = window.location.href;
+      checkServerHealth();
+    });
+
+    // ── 서버 상태 확인 ──
+    async function checkServerHealth() {
+      const dot = document.getElementById('statusDot');
+      const text = document.getElementById('statusText');
+
+      if (window.location.protocol === 'file:') {
+        dot.className = 'inline-block w-2 h-2 rounded-full bg-red-500 mr-1';
+        text.textContent = '서버 미연결';
+        showState('serverError');
+        document.getElementById('searchBtn').disabled = true;
+        return false;
+      }
+
+      try {
+        const resp = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(5000) });
+        if (resp.ok) {
+          dot.className = 'inline-block w-2 h-2 rounded-full bg-green-400 mr-1';
+          text.textContent = '서버 연결됨';
+          serverConnected = true;
+          document.getElementById('searchBtn').disabled = false;
+          const serverErrorEl = document.getElementById('serverError');
+          if (!serverErrorEl.classList.contains('hidden')) {
+            showState('empty');
+          }
+          return true;
+        }
+      } catch (e) {}
+
+      dot.className = 'inline-block w-2 h-2 rounded-full bg-red-500 mr-1';
+      text.textContent = '서버 미연결';
+      serverConnected = false;
+      showState('serverError');
+      document.getElementById('searchBtn').disabled = true;
+      return false;
+    }
+
+    function formatDateInput(d) {
+      return d.toISOString().split('T')[0];
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function resetSearchBtn() {
+      const btn = document.getElementById('searchBtn');
+      btn.disabled = false;
+      btn.textContent = '검색';
+      btn.classList.remove('opacity-60');
+    }
+
+    function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT) {
+      const controller = new AbortController();
+      const signal = controller.signal;
+      if (options.signal) {
+        options.signal.addEventListener('abort', () => controller.abort());
+      }
+      const merged = { ...options, signal };
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      return fetch(url, merged).finally(() => clearTimeout(timer));
+    }
+
+    // ── 검색 (자동 재시도 포함) ──
+    async function doSearch(page, _retryCount) {
+      const retryCount = _retryCount || 0;
+      const keyword = document.getElementById('keywordInput').value.trim();
+      const corpName = document.getElementById('corpNameInput').value.trim();
+      if (!keyword && !corpName) {
+        alert('검색 키워드 또는 회사명을 입력해주세요.');
+        document.getElementById('keywordInput').focus();
+        return;
+      }
+      if (keyword && keyword.length < 2) {
+        alert('검색어는 2자 이상 입력해주세요.');
+        return;
+      }
+
+      const dspTypes = [];
+      if (document.getElementById('dspA').checked) dspTypes.push('A');
+      if (document.getElementById('dspF').checked) dspTypes.push('F');
+      if (dspTypes.length === 0) {
+        alert('공시유형을 하나 이상 선택해주세요.');
+        return;
+      }
+
+      if (!serverConnected) {
+        const ok = await checkServerHealth();
+        if (!ok) return;
+      }
+
+      if (searchAbortController) {
+        searchAbortController.abort();
+      }
+      searchAbortController = new AbortController();
+
+      currentPage = page;
+      showState('loading');
+
+      const searchBtn = document.getElementById('searchBtn');
+      searchBtn.disabled = true;
+      searchBtn.textContent = retryCount > 0 ? '재시도 중...' : '검색 중...';
+      searchBtn.classList.add('opacity-60');
+
+      const startDate = document.getElementById('startDate').value;
+      const endDate = document.getElementById('endDate').value;
+      const maxResults = document.getElementById('maxResults').value;
+
+      const params = new URLSearchParams({
+        keyword,
+        start_date: startDate,
+        end_date: endDate,
+        page: String(page),
+        max_results: maxResults,
+        dsp_type: dspTypes.join(','),
+        corp_name: corpName,
+      });
+
+      const t0 = Date.now();
+      try {
+        const resp = await fetchWithTimeout(
+          `${API_BASE}/search?${params}`,
+          { signal: searchAbortController.signal },
+          FETCH_TIMEOUT
+        );
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          showError(
+            data.error || '검색에 실패했습니다.',
+            resp.status === 502 ? '검색 기간을 줄이거나 잠시 후 다시 시도해주세요.' : '',
+            true
+          );
+          return;
+        }
+
+        currentResults = data.results || [];
+        totalPages = data.total_pages || 0;
+        if (currentResults.length === 0) {
+          showState('noResults');
+          return;
+        }
+
+        allAuditors = {};
+        currentResults.forEach(r => {
+          if (r.auditor) allAuditors[r.rcept_no] = r.auditor;
+        });
+
+        lastSearchData = data;
+        renderResults(data);
+        showState('results');
+
+        if (corpName && data.corp_name_resolved === false) {
+          showCorpWarning(corpName);
+        }
+
+        const needExtraction = (data.need_auditor_extraction || []).filter(r => r);
+        if (needExtraction.length > 0) {
+          extractAuditors(needExtraction);
+        }
+
+      } catch (err) {
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+        if (err.name === 'AbortError') {
+          if (retryCount < 1) {
+            console.log('타임아웃 발생, 자동 재시도...');
+            resetSearchBtn();
+            setTimeout(() => doSearch(page, retryCount + 1), 1000);
+            return;
+          }
+          showError(
+            `요청 시간이 초과되었습니다. (${elapsed}초 경과)`,
+            '검색 기간을 줄이거나 잠시 후 다시 시도해주세요.',
+            true
+          );
+        } else {
+          if (retryCount < 1) {
+            console.log('연결 실패, 서버 상태 확인 후 자동 재시도...');
+            resetSearchBtn();
+            const ok = await checkServerHealth();
+            if (ok) {
+              setTimeout(() => doSearch(page, retryCount + 1), 2000);
+              return;
+            }
+            return;
+          }
+          showError(
+            `서버 연결에 실패했습니다. (${elapsed}초 경과)`,
+            `상세: ${err.message || 'Unknown error'}\n현재 URL: ${window.location.href}`,
+            true
+          );
+        }
+      } finally {
+        resetSearchBtn();
+      }
+    }
+
+    function renderResults(data) {
+      const body = document.getElementById('resultsBody');
+      const keyword = document.getElementById('keywordInput').value.trim();
+      body.innerHTML = '';
+
+      currentResults.forEach((r, idx) => {
+        const auditor = getAuditor(r);
+        const auditorHtml = auditor
+          ? `<span class="text-blue-700 font-medium auditor-cell">${escapeHtml(auditor)}</span>`
+          : (r.filing_type.includes('정기공시')
+            ? '<span class="text-gray-400 text-xs auditor-cell" data-rcept="' + r.rcept_no + '"><svg class="inline w-3 h-3 spin mr-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>추출 중</span>'
+            : '<span class="text-gray-300 auditor-cell">-</span>');
+
+        const marketBadge = r.market
+          ? `<span class="badge ${r.market === '유가증권시장' || r.market === '코스피' ? 'badge-blue' : r.market === '코스닥' ? 'badge-green' : 'badge-orange'}">${escapeHtml(r.market)}</span>`
+          : '';
+
+        const snippetHtml = (r.snippet && keyword)
+          ? `<div class="text-xs text-gray-500 mt-1.5 leading-relaxed bg-gray-50 rounded px-2 py-1.5 border-l-2 border-blue-200">${highlightKeyword(escapeHtml(r.snippet), keyword)}</div>`
+          : '';
+
+        const tr = document.createElement('tr');
+        tr.className = 'result-row';
+        tr.dataset.rceptNo = r.rcept_no;
+        tr.dataset.auditor = auditor;
+        tr.dataset.reportName = r.report_name || '';
+        tr.innerHTML = `
+          <td class="px-3 py-2.5 text-gray-400 text-xs row-num">${idx + 1}</td>
+          <td class="px-3 py-2.5 text-gray-600 text-xs whitespace-nowrap">${escapeHtml(r.date)}</td>
+          <td class="px-3 py-2.5">${marketBadge}</td>
+          <td class="px-3 py-2.5 font-medium text-gray-800">${escapeHtml(r.company_name)}</td>
+          <td class="px-3 py-2.5">
+            <div class="text-gray-700">${escapeHtml(r.report_name)}</div>
+            ${snippetHtml}
+          </td>
+          <td class="px-3 py-2.5">${auditorHtml}</td>
+          <td class="px-3 py-2.5 text-center">
+            <a href="${r.dart_url}" target="_blank" class="inline-flex items-center gap-1 text-xs px-2 py-1 bg-blue-50 text-blue-600 rounded hover:bg-blue-100 transition-colors" title="DART 원문 보기">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+              DART
+            </a>
+          </td>`;
+        body.appendChild(tr);
+      });
+
+      document.getElementById('totalCount').textContent = `검색결과 ${currentResults.length}건`;
+      document.getElementById('pageInfo').textContent = totalPages ? `(${currentPage} / ${totalPages.toLocaleString()} 페이지)` : `(${currentPage}페이지)`;
+      document.getElementById('statusBar').classList.remove('hidden');
+
+      renderPagination(data);
+      updateAuditorTags();
+      applyReportTypeFilter();
+      applyAuditorFilter();
+    }
+
+    function getAuditor(r) {
+      return allAuditors[r.rcept_no] || r.auditor || '';
+    }
+
+    function highlightKeyword(text, keyword) {
+      if (!keyword) return text;
+      const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return text.replace(new RegExp(escaped, 'gi'), '<span class="highlight-keyword">$&</span>');
+    }
+
+    // ── 보고서 유형 필터 ──
+    function applyReportTypeFilter() {
+      const showAudit = document.getElementById('rptAudit').checked;
+      const showBiz = document.getElementById('rptBiz').checked;
+      const showHalf = document.getElementById('rptHalf').checked;
+      const allChecked = showAudit && showBiz && showHalf;
+
+      const rows = document.querySelectorAll('#resultsBody .result-row');
+      rows.forEach(row => {
+        if (allChecked) {
+          row.classList.remove('hidden-by-rpt');
+          return;
+        }
+
+        const name = (row.dataset.reportName || '').trim();
+        const isAudit = /감사보고서/.test(name);
+        const isBiz = /사업보고서/.test(name);
+        const isHalf = /(반기|분기)/.test(name);
+
+        let match = false;
+        if (showAudit && isAudit) match = true;
+        if (showBiz && isBiz) match = true;
+        if (showHalf && isHalf) match = true;
+        if (!isAudit && !isBiz && !isHalf) match = true;
+
+        if (match) {
+          row.classList.remove('hidden-by-rpt');
+        } else {
+          row.classList.add('hidden-by-rpt');
+        }
+      });
+
+      applyAuditorFilter();
+    }
+
+    // ── 감사인명 필터 (텍스트 입력 기반) ──
+    function applyAuditorFilter() {
+      const filterText = document.getElementById('auditorNameInput').value.trim();
+      const rows = document.querySelectorAll('#resultsBody .result-row');
+      let visibleCount = 0;
+      let num = 0;
+
+      rows.forEach(row => {
+        if (row.classList.contains('hidden-by-rpt')) return;
+
+        const rceptNo = row.dataset.rceptNo;
+        const auditor = allAuditors[rceptNo] || row.dataset.auditor || '';
+
+        if (!filterText || auditor.includes(filterText)) {
+          row.classList.remove('hidden-by-filter');
+          num++;
+          row.querySelector('.row-num').textContent = num;
+          visibleCount++;
+        } else {
+          row.classList.add('hidden-by-filter');
+        }
+      });
+
+      const filterInfo = document.getElementById('filterInfo');
+      const pendingNotice = document.getElementById('auditorPendingNotice');
+      const extracting = !document.getElementById('auditorExtractStatus').classList.contains('hidden');
+
+      if (filterText && lastSearchData) {
+        filterInfo.textContent = `[감사인 필터: "${filterText}"] ${visibleCount}건 표시`;
+        filterInfo.classList.remove('hidden');
+
+        if (visibleCount === 0 && extracting) {
+          pendingNotice.classList.remove('hidden');
+        } else {
+          pendingNotice.classList.add('hidden');
+        }
+      } else {
+        filterInfo.classList.add('hidden');
+        pendingNotice.classList.add('hidden');
+      }
+
+      highlightActiveTag();
+    }
+
+    function clearAuditorInput() {
+      document.getElementById('auditorNameInput').value = '';
+      document.getElementById('auditorClearBtn').classList.add('hidden');
+      applyAuditorFilter();
+    }
+
+    function clearAuditorFilter() {
+      clearAuditorInput();
+    }
+
+    // ── 감사인 추출 ──
+    async function extractAuditors(rceptNos) {
+      const statusEl = document.getElementById('auditorExtractStatus');
+      const statusText = document.getElementById('extractStatusText');
+      statusEl.classList.remove('hidden');
+
+      const batchSize = 3;
+      let processed = 0;
+      let failed = 0;
+
+      for (let i = 0; i < rceptNos.length; i += batchSize) {
+        const batch = rceptNos.slice(i, i + batchSize);
+        statusText.textContent = `감사인 추출 중... (${processed}/${rceptNos.length})`;
+
+        try {
+          const resp = await fetchWithTimeout(`${API_BASE}/extract-auditors`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rcept_nos: batch }),
+          }, 45000);
+          const data = await resp.json();
+
+          if (data.auditors) {
+            Object.entries(data.auditors).forEach(([rcept, auditor]) => {
+              if (auditor) {
+                allAuditors[rcept] = auditor;
+                const cell = document.querySelector(`[data-rcept="${rcept}"]`);
+                if (cell) {
+                  cell.outerHTML = `<span class="text-blue-700 font-medium auditor-cell">${escapeHtml(auditor)}</span>`;
+                }
+                const row = document.querySelector(`tr[data-rcept-no="${rcept}"]`);
+                if (row) row.dataset.auditor = auditor;
+              } else {
+                const cell = document.querySelector(`[data-rcept="${rcept}"]`);
+                if (cell) {
+                  cell.outerHTML = '<span class="text-gray-300 text-xs auditor-cell">-</span>';
+                }
+              }
+            });
+            updateAuditorTags();
+            applyAuditorFilter();
+          }
+        } catch (err) {
+          console.warn('감사인 추출 실패:', err);
+          failed += batch.length;
+          batch.forEach(rcept => {
+            const cell = document.querySelector(`[data-rcept="${rcept}"]`);
+            if (cell) {
+              cell.outerHTML = '<span class="text-gray-300 text-xs auditor-cell">-</span>';
+            }
+          });
+        }
+        processed += batch.length;
+      }
+
+      statusText.textContent = failed > 0
+        ? `감사인 추출 완료 (${processed - failed}건 성공, ${failed}건 실패)`
+        : `감사인 추출 완료 (${processed}건)`;
+      setTimeout(() => statusEl.classList.add('hidden'), 3000);
+    }
+
+    // ── 감사인 태그 (보조 필터) ──
+    function updateAuditorTags() {
+      const auditorCounts = {};
+      currentResults.forEach(r => {
+        const a = getAuditor(r);
+        if (a) auditorCounts[a] = (auditorCounts[a] || 0) + 1;
+      });
+
+      const sorted = Object.entries(auditorCounts).sort((a, b) => b[1] - a[1]);
+      if (sorted.length === 0) {
+        document.getElementById('auditorFilter').classList.add('hidden');
+        return;
+      }
+
+      const container = document.getElementById('auditorTags');
+      container.innerHTML = '';
+      const currentFilterText = document.getElementById('auditorNameInput').value.trim();
+
+      sorted.forEach(([auditor, count]) => {
+        const tag = document.createElement('button');
+        const isActive = currentFilterText && auditor.includes(currentFilterText);
+        tag.className = `auditor-tag badge ${isActive ? 'badge-blue active' : 'badge-gray'}`;
+        tag.textContent = `${auditor} (${count})`;
+        tag.onclick = () => {
+          const input = document.getElementById('auditorNameInput');
+          if (input.value.trim() === auditor) {
+            input.value = '';
+            document.getElementById('auditorClearBtn').classList.add('hidden');
+          } else {
+            input.value = auditor;
+            document.getElementById('auditorClearBtn').classList.remove('hidden');
+          }
+          applyAuditorFilter();
+        };
+        container.appendChild(tag);
+      });
+      document.getElementById('auditorFilter').classList.remove('hidden');
+    }
+
+    function highlightActiveTag() {
+      const filterText = document.getElementById('auditorNameInput').value.trim();
+      document.querySelectorAll('#auditorTags .auditor-tag').forEach(tag => {
+        const tagName = tag.textContent.replace(/\s*\(\d+\)$/, '');
+        if (filterText && tagName === filterText) {
+          tag.classList.remove('badge-gray');
+          tag.classList.add('badge-blue', 'active');
+        } else {
+          tag.classList.remove('badge-blue', 'active');
+          tag.classList.add('badge-gray');
+        }
+      });
+    }
+
+    // ── 페이지네이션 ──
+    function renderPagination(data) {
+      const container = document.getElementById('pagination');
+      container.innerHTML = '';
+
+      if (data.has_prev) {
+        const btn = document.createElement('button');
+        btn.className = 'px-3 py-1.5 text-sm border rounded hover:bg-gray-50 transition-colors';
+        btn.textContent = '< 이전';
+        btn.onclick = () => doSearch(currentPage - 1);
+        container.appendChild(btn);
+      }
+
+      const pageSpan = document.createElement('span');
+      pageSpan.className = 'px-3 py-1.5 text-sm text-gray-500';
+      pageSpan.textContent = `${currentPage} 페이지`;
+      container.appendChild(pageSpan);
+
+      if (data.has_next) {
+        const btn = document.createElement('button');
+        btn.className = 'px-3 py-1.5 text-sm border rounded hover:bg-gray-50 transition-colors';
+        btn.textContent = '다음 >';
+        btn.onclick = () => doSearch(currentPage + 1);
+        container.appendChild(btn);
+      }
+    }
+
+    // ── UI 상태 관리 ──
+    function showState(state) {
+      ['loadingState', 'emptyState', 'resultsArea', 'noResults', 'errorState', 'serverError'].forEach(id => {
+        document.getElementById(id).classList.add('hidden');
+      });
+      document.getElementById('corpWarning').classList.add('hidden');
+      if (state === 'loading') document.getElementById('loadingState').classList.remove('hidden');
+      else if (state === 'empty') document.getElementById('emptyState').classList.remove('hidden');
+      else if (state === 'results') document.getElementById('resultsArea').classList.remove('hidden');
+      else if (state === 'noResults') document.getElementById('noResults').classList.remove('hidden');
+      else if (state === 'error') document.getElementById('errorState').classList.remove('hidden');
+      else if (state === 'serverError') document.getElementById('serverError').classList.remove('hidden');
+
+      if (state !== 'results') {
+        document.getElementById('statusBar').classList.add('hidden');
+        document.getElementById('auditorFilter').classList.add('hidden');
+        document.getElementById('filterInfo').classList.add('hidden');
+        document.getElementById('auditorPendingNotice').classList.add('hidden');
+      }
+    }
+
+    function showCorpWarning(corpName) {
+      const el = document.getElementById('corpWarning');
+      document.getElementById('corpWarningText').textContent =
+        `"${corpName}" 회사명이 DART에서 정확히 매칭되지 않아 회사 필터가 적용되지 않았습니다. 정확한 DART 등록 회사명을 입력해주세요.`;
+      el.classList.remove('hidden');
+    }
+
+    function showError(msg, hint, showRetry) {
+      document.getElementById('errorMessage').textContent = msg;
+      document.getElementById('errorHint').textContent = hint || '';
+      const retryBtn = document.getElementById('retryBtn');
+      if (showRetry) {
+        retryBtn.classList.remove('hidden');
+      } else {
+        retryBtn.classList.add('hidden');
+      }
+      showState('error');
+    }
+
+  </script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+.env
+Opendart.env
+__pycache__/
+*.pyc
+.claude/
