@@ -65,7 +65,7 @@
         <div class="flex-1">
           <label class="block text-sm font-medium text-gray-700 mb-1">본문 검색어</label>
           <div class="relative">
-            <input id="keywordInput" type="text" placeholder="본문 키워드 (선택) — 비워두고 회사명만 입력하면 공시목록 조회"
+            <input id="keywordInput" type="text" placeholder="본문 키워드 (선택) — AND/OR/NOT 지원 (예: 운용리스 AND 리스부채)"
                    class="w-full px-4 py-2.5 pr-10 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
                    autocomplete="off">
             <svg class="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -77,7 +77,12 @@
                 class="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors whitespace-nowrap">
           검색
         </button>
+        <button onclick="toggleHistoryPanel()" class="px-3 py-2.5 border border-gray-300 rounded-lg text-sm hover:bg-gray-50 transition-colors" title="검색 기록">
+          <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </button>
       </div>
+      <!-- History Panel -->
+      <div id="historyPanel" class="hidden mt-2 p-3 bg-white border rounded-lg shadow-sm max-w-md"></div>
 
       <!-- Filters Row -->
       <div class="mt-3 flex flex-wrap gap-4 items-end">
@@ -118,6 +123,10 @@
               <span>분·반기보고서</span>
             </label>
           </div>
+          <label class="flex items-center gap-1 text-xs cursor-pointer mt-1.5 text-gray-700 hover:text-gray-900" title="사업보고서/분반기보고서에 첨부된 (연결)감사보고서 섹션 안에서 키워드가 발견된 결과만 표시. XML 본문 검증을 거치므로 스캔 속도가 느려집니다.">
+            <input type="checkbox" id="auditContentOnly" class="rounded border-gray-300 text-blue-600 focus:ring-blue-500" onchange="onAuditContentOnlyChange()">
+            <span>📑 (연결)감사보고서 본문에서만 키워드 매칭</span>
+          </label>
         </div>
         <div>
           <label class="block text-xs text-gray-500 mb-1">회사명 (선택)</label>
@@ -165,6 +174,51 @@
     <!-- Corp Name Warning -->
     <div id="corpWarning" class="hidden mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
       <strong>주의:</strong> <span id="corpWarningText"></span>
+    </div>
+
+    <!-- 전체 검색결과 감사인 스캔 배너 -->
+    <div id="scanBanner" class="hidden mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+      <div class="flex items-center gap-3 text-sm">
+        <svg id="scanSpinner" class="w-4 h-4 text-blue-500 spin flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        <span id="scanStatusText" class="text-blue-800 font-medium"></span>
+        <span id="scanProgressText" class="text-xs text-blue-600"></span>
+        <button id="scanCancelBtn" onclick="cancelScan()" class="ml-auto px-2.5 py-1 text-xs border border-blue-300 bg-white rounded hover:bg-blue-100 transition-colors">중단</button>
+        <button id="scanRestartBtn" onclick="restartScan()" class="hidden ml-auto px-2.5 py-1 text-xs border border-blue-300 bg-white rounded hover:bg-blue-100 transition-colors">다시 스캔</button>
+        <button id="scanExtendBtn" onclick="extendScan()" class="hidden ml-auto px-2.5 py-1 text-xs border border-blue-400 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors font-medium">⊕ 다음 100 페이지 추가 스캔</button>
+      </div>
+      <div class="mt-2 h-1.5 bg-blue-100 rounded overflow-hidden">
+        <div id="scanProgressBar" class="h-full bg-blue-500 transition-all" style="width:0%"></div>
+      </div>
+      <!-- 커버리지 정보 -->
+      <div id="scanCoverage" class="mt-2 flex items-center justify-between text-xs text-blue-700">
+        <span id="scanCoverageText"></span>
+        <button id="scanTipToggle" onclick="toggleScanTips()" type="button" class="text-blue-600 hover:underline whitespace-nowrap">
+          🔍 더 정확히 찾는 방법 ▼
+        </button>
+      </div>
+      <!-- 검색 범위 확장 가이드 -->
+      <div id="scanTips" class="hidden mt-2 p-2.5 bg-white border border-blue-200 rounded text-xs text-gray-700 space-y-2">
+        <div>
+          <p class="font-medium text-gray-800 mb-1">📊 모집단(검색 매칭 N건)이 무엇을 의미하나요?</p>
+          <p class="text-gray-600 leading-relaxed">표시되는 모집단은 <strong>전체 DART 공시</strong>가 아니라, 이미 <strong>DART 본문검색이 적용된 1차 결과</strong>입니다. 즉 키워드·회사명·기간·공시유형 필터를 거친 후의 건수입니다. 이 모집단 안에서 다시 (1) AND 본문 키워드, (2) 감사인 추출/매칭이 순차 적용됩니다.</p>
+          <pre class="mt-1.5 p-2 bg-gray-50 rounded text-[11px] text-gray-700 leading-relaxed whitespace-pre-wrap" id="scanFunnelDiagram"></pre>
+        </div>
+        <div class="pt-2 border-t border-gray-100">
+          <p class="font-medium text-gray-800 mb-1">🔢 어떤 순서로 100건이 선택되나요?</p>
+          <p class="text-gray-600 leading-relaxed">DART 본문검색은 <strong>접수일 최신순(종료일에 가까운 공시부터)</strong>으로 결과를 반환합니다. 즉 1차 스캔의 100건은 <strong>가장 최근에 공시된 100건</strong>이며, "다음 100 페이지 추가 스캔" 버튼은 그 뒤(더 오래된 공시) 100건을 이어서 가져옵니다. 따라서 오래된 보고서를 빨리 찾고 싶다면 <strong>종료일을 과거 시점으로 좁히는 것</strong>이 가장 빠릅니다.</p>
+        </div>
+        <div class="pt-2 border-t border-gray-100">
+          <p class="font-medium text-gray-800 mb-1">📋 범위를 좁혀 정확도를 높이는 방법:</p>
+          <ul class="list-disc list-inside space-y-1 text-gray-600">
+            <li><strong>날짜 범위 단축</strong> — 예: 3년 → 1년 또는 6개월. 모집단 자체가 줄어 매칭이 잘 보입니다.</li>
+            <li><strong>회사명 필터 추가</strong> — 특정 기업이 정해져 있다면 회사명 입력. 모집단이 그 회사의 공시로 한정됩니다.</li>
+            <li><strong>키워드 구체화</strong> — 예: <code class="bg-gray-100 px-1 rounded">사업결합</code> → <code class="bg-gray-100 px-1 rounded">사업결합 영업권 손상</code>. AND 조건으로 잘라내기.</li>
+            <li><strong>보고서 유형 좁히기</strong> — 사업보고서만 또는 감사보고서만 체크.</li>
+            <li><strong>분할 검색</strong> — 기간을 분기/연도별로 쪼개서 여러 번 검색. 각 검색별로 1차 스캔 한도를 다시 확보할 수 있습니다.</li>
+          </ul>
+        </div>
+        <p class="text-gray-500 pt-2 border-t border-gray-100">1차 스캔 단위: 100 DART 페이지(≈상위 약 1만건 DART 결과 → 키워드 AND 필터 적용 후 표시). OpenDART 일일 호출 한도 20,000건 고려.</p>
+      </div>
     </div>
 
     <!-- Auditor Tags (supplementary) -->
@@ -215,6 +269,45 @@
           </table>
         </div>
       </div>
+
+      <!-- Toolbar: Export, Sort, Stats -->
+      <div class="flex items-center justify-between mt-3 px-1">
+        <div class="flex items-center gap-2">
+          <button onclick="exportToExcel()" class="px-3 py-1.5 text-xs border border-gray-300 rounded hover:bg-gray-50 transition-colors flex items-center gap-1" title="Excel 다운로드">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+          </button>
+          <button onclick="toggleStats()" class="px-3 py-1.5 text-xs border border-gray-300 rounded hover:bg-gray-50 transition-colors flex items-center gap-1" title="통계 보기">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+            통계
+          </button>
+          <button onclick="showAuditorChanges()" class="px-3 py-1.5 text-xs border border-gray-300 rounded hover:bg-gray-50 transition-colors flex items-center gap-1" title="감사인 변경 추적">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/></svg>
+            감사인변경
+          </button>
+        </div>
+        <div class="flex items-center gap-2">
+          <label class="text-xs text-gray-500">정렬:</label>
+          <select id="sortSelect" onchange="applySorting()" class="text-xs px-2 py-1 border border-gray-300 rounded focus:ring-1 focus:ring-blue-500 outline-none">
+            <option value="date_desc">접수일 최신순</option>
+            <option value="date_asc">접수일 오래된순</option>
+            <option value="company">회사명순</option>
+            <option value="auditor">감사인순</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Stats Panel -->
+      <div id="statsPanel" class="hidden mt-3 p-4 bg-white border rounded-lg">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-gray-700">검색결과 통계</h3>
+          <button onclick="toggleStats()" class="text-xs text-gray-400 hover:text-gray-600">닫기</button>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="statsContent"></div>
+      </div>
+
+      <!-- Auditor Change Panel -->
+      <div id="auditorChangePanel" class="hidden mt-3 p-4 bg-white border rounded-lg"></div>
 
       <!-- Pagination -->
       <div id="pagination" class="flex items-center justify-center gap-2 mt-4"></div>
@@ -272,6 +365,13 @@
     let searchAbortController = null;
     let serverConnected = false;
 
+    // ── 전체 검색결과 감사인 스캔 상태 ──
+    const SCAN_INITIAL_API_PAGES = 20;   // 1회 스캔 단위 (1 backend page = DART 5페이지) → 100 DART 페이지
+    const SCAN_AUDITOR_BATCH = 10;       // 감사인 추출 배치 크기
+    const SCAN_API_PAGE_SIZE = 500;      // 백엔드 page 1회당 최대 반환 건수
+    let scanState = null;                // {active, done, cancelled, records, seenRcept, auditors, extractedRcepts, pagesScanned, pageLimit, hasMoreOnDart, controller, ctx, multiKw, primaryKeyword}
+    let pageResultsBackup = null;        // 스캔 뷰 진입 시 페이지 뷰 결과 백업 (null = 페이지 뷰 활성)
+
     // ── 초기화 ──
     document.addEventListener('DOMContentLoaded', () => {
       const now = new Date();
@@ -289,13 +389,7 @@
 
       const auditorInput = document.getElementById('auditorNameInput');
       auditorInput.addEventListener('input', () => {
-        const clearBtn = document.getElementById('auditorClearBtn');
-        if (auditorInput.value.trim()) {
-          clearBtn.classList.remove('hidden');
-        } else {
-          clearBtn.classList.add('hidden');
-        }
-        applyAuditorFilter();
+        onAuditorFilterInput();
       });
 
       document.getElementById('currentUrl').textContent = window.location.href;
@@ -399,6 +493,11 @@
       }
       searchAbortController = new AbortController();
 
+      // 새 검색 시 진행 중인 스캔 중단 + 상태 초기화
+      resetScanState();
+      pageResultsBackup = null;
+      hideScanBanner();
+
       currentPage = page;
       showState('loading');
 
@@ -431,6 +530,7 @@
         const data = await resp.json();
 
         if (!resp.ok) {
+          if (data.error && /api.?key/i.test(data.error)) showApiKeyNotice();
           showError(
             data.error || '검색에 실패했습니다.',
             resp.status === 502 ? '검색 기간을 줄이거나 잠시 후 다시 시도해주세요.' : '',
@@ -648,11 +748,653 @@
     function clearAuditorInput() {
       document.getElementById('auditorNameInput').value = '';
       document.getElementById('auditorClearBtn').classList.add('hidden');
-      applyAuditorFilter();
+      onAuditorFilterInput();
     }
 
     function clearAuditorFilter() {
       clearAuditorInput();
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 전체 검색결과 감사인 스캔 (백그라운드) ──
+    // ══════════════════════════════════════════════════
+    function onAuditorFilterInput() {
+      const filterText = document.getElementById('auditorNameInput').value.trim();
+      const clearBtn = document.getElementById('auditorClearBtn');
+      if (filterText) clearBtn.classList.remove('hidden');
+      else clearBtn.classList.add('hidden');
+
+      if (filterText) {
+        if (!scanState && lastSearchData) ensureScan();
+        enterScanView();
+      } else {
+        exitScanView();
+      }
+      highlightActiveTag();
+    }
+
+    function resetScanState() {
+      if (scanState && scanState.controller) {
+        try { scanState.controller.abort(); } catch (e) {}
+      }
+      scanState = null;
+    }
+
+    function getCurrentSearchContext() {
+      const dspTypes = [];
+      if (document.getElementById('dspA').checked) dspTypes.push('A');
+      if (document.getElementById('dspF').checked) dspTypes.push('F');
+      return {
+        keyword: document.getElementById('keywordInput').value.trim(),
+        corp_name: document.getElementById('corpNameInput').value.trim(),
+        start_date: document.getElementById('startDate').value,
+        end_date: document.getElementById('endDate').value,
+        dsp_types: dspTypes,
+      };
+    }
+
+    function buildDartKeyword(rawKeyword, multiKw) {
+      if (!multiKw || multiKw.length === 0) return rawKeyword;
+      // AND 연산자 항목을 space-separated로 합쳐 DART에 전달 → DART가 native AND 필터 수행
+      const andTerms = multiKw.filter(k => k.op === 'AND').map(k => k.term);
+      if (andTerms.length === 0) return multiKw[0].term;
+      return andTerms.join(' ');
+    }
+
+    function getClientSideMultiKw(multiKw) {
+      // DART가 AND를 처리하므로 클라이언트 측에서는 OR/NOT만 추가 검증
+      if (!multiKw) return null;
+      const remaining = multiKw.filter(k => k.op !== 'AND');
+      return remaining.length > 0 ? remaining : null;
+    }
+
+    function ensureScan() {
+      if (scanState && (scanState.active || scanState.done || scanState.cancelled)) return;
+      const ctx = getCurrentSearchContext();
+      if (!ctx.keyword && !ctx.corp_name) return;
+      if (!ctx.keyword) {
+        // 키워드 없는 회사명-only 조회는 list.json 단일 호출 → 이미 전체가 lastSearchData에 있음
+        return;
+      }
+
+      const multiKw = parseMultiKeyword(ctx.keyword);
+      const primaryKeyword = buildDartKeyword(ctx.keyword, multiKw);
+
+      scanState = {
+        active: true,
+        done: false,
+        cancelled: false,
+        records: [],
+        seenRcept: new Set(),
+        auditors: {},
+        extractedRcepts: new Set(),
+        pagesScanned: 0,
+        pageLimit: SCAN_INITIAL_API_PAGES,  // 동적 확장 가능
+        hasMoreOnDart: false,               // 마지막 fetch에서 has_next=true였는지
+        totalUniverse: 0,                   // DART 전체 검색 결과 건수
+        controller: new AbortController(),
+        ctx,
+        multiKw,
+        primaryKeyword,
+        auditOnly: isAuditContentOnly(),    // 감사보고서 본문 한정 모드
+        auditVerified: {},                  // rcept_no → {matched, in_audit, in_consolidated, has_audit_section, has_consolidated_section}
+        auditCheckedRcepts: new Set(),      // 이미 검증 요청한 rcept_no
+        droppedByAuditCheck: 0,             // 검증 실패로 제외된 건수
+      };
+
+      // 이미 로드된 첫 페이지 결과를 시드로 활용
+      const seed = pageResultsBackup || currentResults || [];
+      seed.forEach(r => {
+        if (r.rcept_no && !scanState.seenRcept.has(r.rcept_no)) {
+          scanState.records.push(r);
+          scanState.seenRcept.add(r.rcept_no);
+          const a = r.auditor || allAuditors[r.rcept_no];
+          if (a) scanState.auditors[r.rcept_no] = a;
+        }
+      });
+
+      showScanBanner();
+      scanLoop().catch(err => {
+        console.warn('스캔 루프 오류:', err);
+        if (scanState) scanState.active = false;
+        updateScanBanner();
+      });
+    }
+
+    // 감사본문 검증을 배치로 실행하고, 실패한 rcept_no는 1건씩 재시도해서 silent drop을 방지
+    async function _verifyBatchWithRetry(rceptNos, keywords, abortSignal) {
+      const all = await verifyAuditContent(rceptNos, keywords, abortSignal);
+      // 결과에 빠진 rcept_no가 있으면 1건씩 재시도
+      const missing = rceptNos.filter(r => !(r in all));
+      for (const rcept of missing) {
+        if (abortSignal && abortSignal.aborted) break;
+        try {
+          const single = await verifyAuditContent([rcept], keywords, abortSignal);
+          if (single[rcept]) all[rcept] = single[rcept];
+          else all[rcept] = { matched: false, in_audit: false, in_consolidated: false, has_audit_section: false, has_consolidated_section: false, error: true };
+        } catch (err) {
+          if (err.name === 'AbortError') break;
+          all[rcept] = { matched: false, in_audit: false, in_consolidated: false, has_audit_section: false, has_consolidated_section: false, error: true };
+        }
+      }
+      return all;
+    }
+
+    // verify 단계: 신규 추가된 record들에 대해 (연결)감사보고서 본문 검증
+    async function _runAuditVerifyForBatch(newlyAdded) {
+      if (!scanState || !scanState.auditOnly || newlyAdded.length === 0) return;
+
+      // 외부감사 타입은 자체가 감사보고서이므로 검증 면제
+      newlyAdded.filter(r => isFilingAlreadyAudit(r)).forEach(r => {
+        scanState.auditVerified[r.rcept_no] = {
+          matched: true, in_audit: true, in_consolidated: false,
+          has_audit_section: true, has_consolidated_section: false,
+          exempt: true,
+        };
+      });
+
+      const toVerify = newlyAdded
+        .filter(r => !isFilingAlreadyAudit(r) && !scanState.auditCheckedRcepts.has(r.rcept_no))
+        .map(r => r.rcept_no);
+      if (toVerify.length === 0) return;
+
+      toVerify.forEach(r => scanState.auditCheckedRcepts.add(r));
+
+      const verifyKeywords = (scanState.multiKw && scanState.multiKw.length > 0)
+        ? scanState.multiKw.filter(k => k.op === 'AND').map(k => k.term)
+        : [scanState.primaryKeyword];
+
+      try {
+        const verifyResults = await _verifyBatchWithRetry(toVerify, verifyKeywords, scanState.controller.signal);
+        for (const [rcept, info] of Object.entries(verifyResults)) {
+          scanState.auditVerified[rcept] = info;
+        }
+        scanState.droppedByAuditCheck = scanState.records.filter(r => {
+          const v = scanState.auditVerified[r.rcept_no];
+          return v && !v.matched;
+        }).length;
+      } catch (err) {
+        if (err.name !== 'AbortError') console.warn('감사본문 검증 단계 오류:', err);
+      }
+      if (pageResultsBackup !== null) rerenderScanResults();
+      updateScanBanner();
+    }
+
+    // extract 단계: 정기공시 record들에 대해 감사인 추출
+    async function _runAuditorExtractForBatch(newlyAdded) {
+      if (!scanState) return;
+      const needExtract = newlyAdded
+        .filter(r => r.rcept_no
+          && (r.filing_type || '').includes('정기공시')
+          && !scanState.auditors[r.rcept_no]
+          && !scanState.extractedRcepts.has(r.rcept_no))
+        .map(r => r.rcept_no);
+      if (needExtract.length === 0) return;
+
+      for (let i = 0; i < needExtract.length; i += SCAN_AUDITOR_BATCH) {
+        if (!scanState || scanState.cancelled) break;
+        const batch = needExtract.slice(i, i + SCAN_AUDITOR_BATCH);
+        batch.forEach(rcept => scanState.extractedRcepts.add(rcept));
+        try {
+          const resp = await fetchWithTimeout(`${API_BASE}/extract-auditors`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rcept_nos: batch }),
+            signal: scanState.controller.signal,
+          }, 90000);
+          const ed = await resp.json();
+          if (ed && ed.auditors) {
+            Object.entries(ed.auditors).forEach(([rcept, auditor]) => {
+              scanState.auditors[rcept] = auditor || '';
+              if (auditor) allAuditors[rcept] = auditor;
+            });
+            if (pageResultsBackup !== null) rerenderScanResults();
+            updateScanBanner();
+          }
+        } catch (err) {
+          if (err.name === 'AbortError' || (scanState && scanState.cancelled)) break;
+          console.warn('스캔 감사인 추출 실패', err);
+        }
+      }
+    }
+
+    async function scanLoop() {
+      if (!scanState) return;
+
+      let consecutiveNoNew = 0;          // 연속 0 신규 페이지 카운트
+      const NO_NEW_TOLERANCE = 2;        // 2회 연속 0건이면 universe 소진으로 판단해 종료
+
+      while (scanState && scanState.active && !scanState.cancelled && scanState.pagesScanned < scanState.pageLimit) {
+        const page = scanState.pagesScanned + 1;
+        const params = new URLSearchParams({
+          keyword: scanState.primaryKeyword,
+          start_date: scanState.ctx.start_date,
+          end_date: scanState.ctx.end_date,
+          page: String(page),
+          max_results: String(SCAN_API_PAGE_SIZE),
+          dsp_type: scanState.ctx.dsp_types.join(','),
+          corp_name: scanState.ctx.corp_name,
+          scan: 'true',
+        });
+
+        let data;
+        try {
+          const resp = await fetchWithTimeout(
+            `${API_BASE}/search?${params}`,
+            { signal: scanState.controller.signal },
+            FETCH_TIMEOUT
+          );
+          data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || '스캔 요청 실패');
+        } catch (err) {
+          if (err.name === 'AbortError' || (scanState && scanState.cancelled)) break;
+          console.warn('스캔 페이지 실패', page, err);
+          break;
+        }
+
+        if (data.total && !scanState.totalUniverse) {
+          scanState.totalUniverse = data.total;
+        }
+
+        let newRecords = data.results || [];
+        const clientKw = getClientSideMultiKw(scanState.multiKw);
+        if (clientKw) {
+          newRecords = filterResultsByMultiKeyword(newRecords, clientKw);
+        }
+
+        const newlyAdded = [];
+        for (const r of newRecords) {
+          if (r.rcept_no && !scanState.seenRcept.has(r.rcept_no)) {
+            scanState.records.push(r);
+            scanState.seenRcept.add(r.rcept_no);
+            if (r.auditor) scanState.auditors[r.rcept_no] = r.auditor;
+            newlyAdded.push(r);
+          }
+        }
+
+        scanState.pagesScanned = page;
+        scanState.hasMoreOnDart = !!data.has_next;
+        updateScanBanner();
+        if (pageResultsBackup !== null) rerenderScanResults();
+
+        // ── 후처리: verify + extract를 병렬 실행 ──
+        await Promise.all([
+          _runAuditVerifyForBatch(newlyAdded),
+          _runAuditorExtractForBatch(newlyAdded),
+        ]);
+
+        // ── 종료 조건 ──
+        // 1) DART에 더 없다고 명시적으로 알려준 경우
+        if (!data.has_next) {
+          scanState.done = true;
+          break;
+        }
+        // 2) 신규 0건 페이지가 NO_NEW_TOLERANCE회 연속 → universe 소진 (DART metadata 오류 방어)
+        if (newlyAdded.length === 0) {
+          consecutiveNoNew++;
+          if (consecutiveNoNew >= NO_NEW_TOLERANCE) {
+            console.info(`스캔 종료: ${NO_NEW_TOLERANCE}회 연속 신규 0건 (universe 소진)`);
+            scanState.done = true;
+            scanState.hasMoreOnDart = false;
+            break;
+          }
+        } else {
+          consecutiveNoNew = 0;
+        }
+      }
+
+      if (scanState) {
+        scanState.active = false;
+        if (!scanState.cancelled) scanState.done = true;
+      }
+      updateScanBanner();
+    }
+
+    function extendScan() {
+      if (!scanState || scanState.active) return;
+      if (!scanState.hasMoreOnDart) return;
+      scanState.pageLimit += SCAN_INITIAL_API_PAGES;
+      scanState.cancelled = false;
+      scanState.done = false;
+      scanState.active = true;
+      scanState.controller = new AbortController();
+      updateScanBanner();
+      scanLoop().catch(err => {
+        console.warn('스캔 확장 오류:', err);
+        if (scanState) scanState.active = false;
+        updateScanBanner();
+      });
+    }
+
+    // ── 감사보고서 본문 한정 모드 ──
+    function isAuditContentOnly() {
+      const el = document.getElementById('auditContentOnly');
+      return !!(el && el.checked);
+    }
+
+    function onAuditContentOnlyChange() {
+      // 모드 변경 시 스캔 재시작 (필터 결과가 달라지므로)
+      if (lastSearchData) {
+        resetScanState();
+        pageResultsBackup = null;
+        hideScanBanner();
+        // 검색을 다시 실행 (현재 페이지 1)
+        doSearch(1);
+      }
+    }
+
+    // 키워드들이 (연결)감사보고서 섹션에 포함되는지 백엔드에 일괄 검증 요청
+    // 배치 8건 단위 + 배치당 90초 타임아웃 (XML 다운로드 + 파싱 시간 고려)
+    async function verifyAuditContent(rceptNos, keywords, abortSignal) {
+      if (!rceptNos || rceptNos.length === 0) return {};
+      const all = {};
+      const BATCH = 8;
+      for (let i = 0; i < rceptNos.length; i += BATCH) {
+        if (abortSignal && abortSignal.aborted) break;
+        const batch = rceptNos.slice(i, i + BATCH);
+        try {
+          const resp = await fetchWithTimeout(`${API_BASE}/check-audit-content`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rcept_nos: batch, keywords }),
+            signal: abortSignal,
+          }, 90000);
+          const data = await resp.json();
+          if (data && data.results) Object.assign(all, data.results);
+          // 진행 중간에 UI 갱신
+          if (scanState && pageResultsBackup !== null) rerenderScanResults();
+          updateScanBanner();
+        } catch (err) {
+          if (err.name === 'AbortError') break;
+          console.warn('감사보고서 본문 검증 배치 실패:', err);
+        }
+      }
+      return all;
+    }
+
+    // 외부감사(F) 타입 자체는 감사보고서이므로 별도 검증 없이 통과
+    function isFilingAlreadyAudit(record) {
+      const ft = record.filing_type || '';
+      return ft.includes('외부감사');
+    }
+
+    function cancelScan() {
+      if (!scanState) return;
+      scanState.cancelled = true;
+      scanState.active = false;
+      if (scanState.controller) {
+        try { scanState.controller.abort(); } catch (e) {}
+      }
+      updateScanBanner();
+    }
+
+    function restartScan() {
+      resetScanState();
+      ensureScan();
+      if (pageResultsBackup !== null) rerenderScanResults();
+    }
+
+    function showScanBanner() {
+      document.getElementById('scanBanner').classList.remove('hidden');
+      updateScanBanner();
+    }
+
+    function hideScanBanner() {
+      document.getElementById('scanBanner').classList.add('hidden');
+    }
+
+    function updateScanBanner() {
+      const banner = document.getElementById('scanBanner');
+      if (!scanState) {
+        banner.classList.add('hidden');
+        return;
+      }
+      const filterText = document.getElementById('auditorNameInput').value.trim();
+
+      // 감사보고서 본문 한정 모드: 검증 통과한 record만 매칭으로 카운트
+      const passesAuditCheck = (r) => {
+        if (!scanState.auditOnly) return true;
+        const v = scanState.auditVerified[r.rcept_no];
+        return v && v.matched;
+      };
+
+      const matchCount = scanState.records.filter(r => {
+        if (!passesAuditCheck(r)) return false;
+        if (!filterText) return true;
+        const a = scanState.auditors[r.rcept_no] || r.auditor || '';
+        return a && a.includes(filterText);
+      }).length;
+
+      // 감사 검증 진행 통계
+      const auditPassCount = scanState.auditOnly
+        ? scanState.records.filter(passesAuditCheck).length
+        : scanState.records.length;
+      const auditCheckedCount = scanState.auditOnly
+        ? scanState.records.filter(r => scanState.auditVerified[r.rcept_no] !== undefined).length
+        : scanState.records.length;
+
+      const spinner = document.getElementById('scanSpinner');
+      const cancelBtn = document.getElementById('scanCancelBtn');
+      const restartBtn = document.getElementById('scanRestartBtn');
+      const extendBtn = document.getElementById('scanExtendBtn');
+      const statusText = document.getElementById('scanStatusText');
+      const progressText = document.getElementById('scanProgressText');
+      const progressBar = document.getElementById('scanProgressBar');
+      const coverageText = document.getElementById('scanCoverageText');
+      const tipToggle = document.getElementById('scanTipToggle');
+
+      const pageLimit = scanState.pageLimit || SCAN_INITIAL_API_PAGES;
+      const pagesPct = Math.min(100, Math.round((scanState.pagesScanned / pageLimit) * 100));
+      const coveragePctRaw = scanState.totalUniverse > 0
+        ? Math.min(100, (scanState.records.length / scanState.totalUniverse) * 100)
+        : 0;
+      const coveragePctRound = Math.round(coveragePctRaw);
+      // 진행률바: 종료되면 100%, 아니면 페이지%와 추출%(고유 공시 / 모집단) 중 더 큰 값을 사용
+      // 단 active 중에는 99%로 캡해 "도달은 했는데 작업이 남았네?" 혼란을 방지
+      let barPct;
+      if (scanState.done && !scanState.hasMoreOnDart) {
+        barPct = 100;
+      } else if (scanState.active) {
+        barPct = Math.min(99, Math.max(pagesPct, coveragePctRound));
+      } else {
+        barPct = Math.max(pagesPct, coveragePctRound);
+      }
+      progressBar.style.width = barPct + '%';
+
+      // 기본: 모든 보조 버튼 숨김
+      cancelBtn.classList.add('hidden');
+      restartBtn.classList.add('hidden');
+      extendBtn.classList.add('hidden');
+
+      const auditNote = scanState.auditOnly
+        ? ` · 📑 감사본문 ${auditPassCount}건 통과(${auditCheckedCount}건 검증)`
+        : '';
+      const titleSuffix = scanState.auditOnly ? ' [감사본문 한정]' : '';
+      const filterLabel = filterText || (scanState.auditOnly ? '감사본문 매칭' : '감사인 미입력');
+
+      // 일관된 progress 텍스트: "추출 N/M건 (P%) · 페이지 X/Y"
+      // - 추출 = 고유 공시 (dedup 후) / 모집단 (DART 검색 매칭)
+      // - 페이지 = 우리 스캔 사이클 진행도
+      const recordsCount = scanState.records.length;
+      const universe = scanState.totalUniverse || 0;
+      const coveragePctText = universe > 0
+        ? (coveragePctRaw < 0.01 ? coveragePctRaw.toFixed(4) :
+           coveragePctRaw < 1 ? coveragePctRaw.toFixed(2) :
+           coveragePctRaw.toFixed(1)) + '%'
+        : '—';
+      const baseProgress = universe > 0
+        ? `추출 ${recordsCount.toLocaleString()}/${universe.toLocaleString()}건 (${coveragePctText}) · 페이지 ${scanState.pagesScanned}/${pageLimit}`
+        : `${recordsCount.toLocaleString()}건 누적 · 페이지 ${scanState.pagesScanned}/${pageLimit}`;
+
+      if (scanState.active) {
+        spinner.classList.remove('hidden');
+        cancelBtn.classList.remove('hidden');
+        statusText.textContent = `🔍 [${filterLabel}] 전체 결과 스캔 중${titleSuffix}`;
+        progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
+      } else if (scanState.cancelled) {
+        spinner.classList.add('hidden');
+        restartBtn.classList.remove('hidden');
+        statusText.textContent = `⏸ 스캔 중단됨${titleSuffix}`;
+        progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
+      } else if (scanState.done) {
+        spinner.classList.add('hidden');
+        const completeIcon = scanState.hasMoreOnDart ? '📦' : '✅';
+        const completeLabel = scanState.hasMoreOnDart ? '1차 스캔 완료' : '전체 스캔 완료 (DART에 더 이상 신규 결과 없음)';
+        statusText.textContent = `${completeIcon} ${completeLabel}${titleSuffix}`;
+        progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
+        if (scanState.hasMoreOnDart) {
+          extendBtn.classList.remove('hidden');
+        }
+      }
+
+      // ── 커버리지 표시 (모집단 대비 실제 추출 건수 비율) ──
+      if (scanState.totalUniverse > 0) {
+        const universe = scanState.totalUniverse;
+        const scannedKept = scanState.records.length;     // dedup 후 고유 공시 = 실제 추출 건수
+        const coveragePct = Math.min(100, (scannedKept / universe) * 100);
+        const pctStr = coveragePct < 0.01
+          ? coveragePct.toFixed(4) + '%'
+          : coveragePct < 1
+            ? coveragePct.toFixed(2) + '%'
+            : coveragePct.toFixed(1) + '%';
+
+        const isPartial = !scanState.done || (scanState.hasMoreOnDart && scannedKept < universe);
+        const icon = isPartial ? '⚠️' : '✅';
+
+        // 다단계 필터 설명: DART 본문검색 결과 → AND 필터 → 감사인 필터
+        const ctx = scanState.ctx || {};
+        const labels = [];
+        labels.push(`키워드 "${escapeHtml(scanState.primaryKeyword)}"`);
+        if (ctx.corp_name) labels.push(`회사 "${escapeHtml(ctx.corp_name)}"`);
+        const filterDesc = labels.join(' + ');
+
+        // 모든 AND 항목 (PRIMARY 포함). DART가 native로 처리.
+        const andTerms = (scanState.multiKw || []).filter(k => k.op === 'AND').map(k => k.term);
+        // 클라이언트가 추가로 적용한 OR/NOT 필터
+        const clientFilters = (scanState.multiKw || []).filter(k => k.op !== 'AND');
+
+        const dartAndNote = andTerms.length > 1
+          ? ` <span class="text-blue-600 font-medium">[DART AND 적용]</span>`
+          : '';
+        const clientNote = clientFilters.length > 0
+          ? ` → <span class="text-gray-600">OR/NOT 필터 통과 <strong>${scannedKept.toLocaleString()}건</strong></span>`
+          : '';
+
+        const note = isPartial ? '— 더 스캔 가능' : '— 모집단 추출 완료';
+
+        coverageText.innerHTML =
+          `${icon} <strong>1차 모집단</strong> (${filterDesc})${dartAndNote} <strong>${universe.toLocaleString()}건</strong> ` +
+          `중 <strong>${scannedKept.toLocaleString()}건</strong> 추출 (<strong>${pctStr}</strong>)` +
+          `${clientNote} ${note}`;
+        tipToggle.style.display = isPartial ? '' : 'none';
+
+        // 깔때기 다이어그램 (tips 섹션 안에 표시)
+        const funnel = document.getElementById('scanFunnelDiagram');
+        if (funnel) {
+          const periodStr = `${ctx.start_date || ''} ~ ${ctx.end_date || ''}`;
+          const dspLabel = (ctx.dsp_types || []).map(t => t === 'A' ? '정기공시' : t === 'F' ? '외부감사' : t).join('/') || '전체';
+          const auditorFilter = filterText || '(미입력)';
+
+          // DART에 실제로 전달된 키워드 (AND 항목 모두 space-joined)
+          const dartKeyword = scanState.primaryKeyword || '';
+          const dartKwLabel = `"${dartKeyword}"`;
+          const corpLabel = ctx.corp_name ? ` + 회사 "${ctx.corp_name}"` : '';
+
+          // 클라이언트 측 보강 필터 (OR/NOT만)
+          const clientKw = (scanState.multiKw || []).filter(k => k.op !== 'AND');
+
+          const lines = [];
+          lines.push(`① DART 본문검색  [키워드 ${dartKwLabel}${corpLabel} · ${periodStr} · ${dspLabel}]`);
+          if (andTerms.length > 0) {
+            lines.push(`     ※ DART가 AND 필터를 native로 처리: 입력의 AND "${andTerms.join('", "')}" 모두 본문에 포함된 결과만 반환`);
+          }
+          lines.push(`     → 모집단 ${universe.toLocaleString()}건 (DART hit 수, 중복 포함)`);
+          lines.push(`     → 추출 ${scannedKept.toLocaleString()}건 (dedup 후 고유 공시, ${pctStr}) · ${scanState.pagesScanned}/${pageLimit} 페이지 사용`);
+
+          if (clientKw.length > 0) {
+            const clientDesc = clientKw.map(k => `${k.op === 'NOT' ? '제외' : 'OR'} "${k.term}"`).join(', ');
+            lines.push(`② 클라이언트 보강 필터  [${clientDesc}]`);
+            lines.push(`     → 통과 ${scannedKept.toLocaleString()}건`);
+          } else {
+            lines.push(`② 클라이언트 보강 필터  (없음 — OR/NOT 조건이 입력되지 않음)`);
+            lines.push(`     → 통과 ${scannedKept.toLocaleString()}건`);
+          }
+
+          let stepNum = 3;
+          if (scanState.auditOnly) {
+            lines.push(`③ 📑 감사보고서/연결감사보고서 본문 검증 (XML 추출)`);
+            lines.push(`     ※ 사업보고서 main 본문이 아닌, 첨부된 (연결)감사보고서 섹션 안에 키워드가 있는 결과만 통과`);
+            lines.push(`     → 검증 ${auditCheckedCount.toLocaleString()}건 / 통과 ${auditPassCount.toLocaleString()}건  (외부감사 타입은 자동 면제)`);
+            stepNum = 4;
+          }
+
+          lines.push(`${stepNum === 3 ? '③' : '④'} 감사인 필터  ["${auditorFilter}"]`);
+          lines.push(`     → 매칭 ${matchCount.toLocaleString()}건  ← 화면에 표시되는 결과`);
+          funnel.textContent = lines.join('\n');
+        }
+      } else {
+        coverageText.textContent = '';
+        tipToggle.style.display = 'none';
+      }
+    }
+
+    function toggleScanTips() {
+      const tips = document.getElementById('scanTips');
+      const toggle = document.getElementById('scanTipToggle');
+      if (tips.classList.contains('hidden')) {
+        tips.classList.remove('hidden');
+        toggle.innerHTML = '🔍 더 정확히 찾는 방법 ▲';
+      } else {
+        tips.classList.add('hidden');
+        toggle.innerHTML = '🔍 더 정확히 찾는 방법 ▼';
+      }
+    }
+
+    function enterScanView() {
+      if (pageResultsBackup === null) {
+        pageResultsBackup = currentResults.slice();
+      }
+      rerenderScanResults();
+    }
+
+    function exitScanView() {
+      if (pageResultsBackup !== null) {
+        currentResults = pageResultsBackup;
+        pageResultsBackup = null;
+        if (lastSearchData) renderResults(lastSearchData);
+      }
+      document.getElementById('pagination').classList.remove('hidden');
+      hideScanBanner();
+    }
+
+    function rerenderScanResults() {
+      const filterText = document.getElementById('auditorNameInput').value.trim();
+      const source = (scanState && scanState.records.length > 0)
+        ? scanState.records
+        : (pageResultsBackup || []);
+
+      let filtered;
+      if (filterText) {
+        filtered = source.filter(r => {
+          const a = (scanState && scanState.auditors[r.rcept_no]) || allAuditors[r.rcept_no] || r.auditor || '';
+          return a && a.includes(filterText);
+        });
+      } else {
+        filtered = source.slice();
+      }
+
+      // 감사보고서 본문 한정 모드: 검증 통과한 record만 표시
+      if (scanState && scanState.auditOnly) {
+        filtered = filtered.filter(r => {
+          const v = scanState.auditVerified[r.rcept_no];
+          return v && v.matched;
+        });
+      }
+
+      currentResults = filtered;
+      if (lastSearchData) renderResults(lastSearchData);
+      document.getElementById('pagination').classList.add('hidden');
+      updateScanBanner();
     }
 
     // ── 감사인 추출 ──
@@ -743,12 +1485,10 @@
           const input = document.getElementById('auditorNameInput');
           if (input.value.trim() === auditor) {
             input.value = '';
-            document.getElementById('auditorClearBtn').classList.add('hidden');
           } else {
             input.value = auditor;
-            document.getElementById('auditorClearBtn').classList.remove('hidden');
           }
-          applyAuditorFilter();
+          onAuditorFilterInput();
         };
         container.appendChild(tag);
       });
@@ -835,6 +1575,418 @@
       }
       showState('error');
     }
+
+    // ══════════════════════════════════════════════════
+    // ── 1. Excel 내보내기 ──
+    // ══════════════════════════════════════════════════
+    function exportToExcel() {
+      if (!currentResults || currentResults.length === 0) {
+        alert('내보낼 검색결과가 없습니다.');
+        return;
+      }
+
+      const BOM = '﻿';
+      const headers = ['No', '접수일', '시장', '회사명', '보고서명', '감사인', 'DART URL'];
+      const rows = currentResults.map((r, i) => [
+        i + 1,
+        r.date || '',
+        r.market || '',
+        r.company_name || '',
+        r.report_name || '',
+        getAuditor(r) || '',
+        r.dart_url || ''
+      ]);
+
+      const csvContent = [headers, ...rows]
+        .map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+        .join('\n');
+
+      const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const keyword = document.getElementById('keywordInput').value.trim() || 'results';
+      a.download = `DART_검색결과_${keyword}_${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 2. 정렬 기능 ──
+    // ══════════════════════════════════════════════════
+    function applySorting() {
+      if (!currentResults || currentResults.length === 0) return;
+
+      const sortBy = document.getElementById('sortSelect').value;
+      const sorted = [...currentResults];
+
+      switch (sortBy) {
+        case 'date_desc':
+          sorted.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+          break;
+        case 'date_asc':
+          sorted.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+          break;
+        case 'company':
+          sorted.sort((a, b) => (a.company_name || '').localeCompare(b.company_name || ''));
+          break;
+        case 'auditor':
+          sorted.sort((a, b) => (getAuditor(a) || 'zzz').localeCompare(getAuditor(b) || 'zzz'));
+          break;
+      }
+
+      currentResults = sorted;
+      renderResults(lastSearchData);
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 3. 통계 대시보드 ──
+    // ══════════════════════════════════════════════════
+    function toggleStats() {
+      const panel = document.getElementById('statsPanel');
+      if (panel.classList.contains('hidden')) {
+        renderStats();
+        panel.classList.remove('hidden');
+      } else {
+        panel.classList.add('hidden');
+      }
+    }
+
+    function renderStats() {
+      if (!currentResults || currentResults.length === 0) return;
+      const container = document.getElementById('statsContent');
+
+      const auditorCounts = {};
+      const marketCounts = {};
+      const yearCounts = {};
+      let withAuditor = 0;
+
+      currentResults.forEach(r => {
+        const auditor = getAuditor(r);
+        if (auditor) {
+          auditorCounts[auditor] = (auditorCounts[auditor] || 0) + 1;
+          withAuditor++;
+        }
+        if (r.market) marketCounts[r.market] = (marketCounts[r.market] || 0) + 1;
+        const year = (r.date || '').slice(0, 4);
+        if (year) yearCounts[year] = (yearCounts[year] || 0) + 1;
+      });
+
+      const topAuditors = Object.entries(auditorCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      const topMarkets = Object.entries(marketCounts).sort((a, b) => b[1] - a[1]);
+      const yearsSorted = Object.entries(yearCounts).sort((a, b) => b[0].localeCompare(a[0]));
+
+      container.innerHTML = `
+        <div class="bg-gray-50 rounded p-3">
+          <div class="text-xs text-gray-500 mb-1">총 검색건수</div>
+          <div class="text-lg font-bold text-gray-800">${currentResults.length}건</div>
+        </div>
+        <div class="bg-gray-50 rounded p-3">
+          <div class="text-xs text-gray-500 mb-1">감사인 식별</div>
+          <div class="text-lg font-bold text-gray-800">${withAuditor}건 <span class="text-xs font-normal text-gray-500">(${Math.round(withAuditor/currentResults.length*100)}%)</span></div>
+        </div>
+        <div class="bg-gray-50 rounded p-3">
+          <div class="text-xs text-gray-500 mb-1">시장 분포</div>
+          <div class="space-y-1">${topMarkets.map(([m, c]) => `<div class="flex justify-between text-xs"><span>${escapeHtml(m)}</span><span class="font-medium">${c}</span></div>`).join('')}</div>
+        </div>
+        <div class="bg-gray-50 rounded p-3">
+          <div class="text-xs text-gray-500 mb-1">연도별</div>
+          <div class="space-y-1">${yearsSorted.slice(0,5).map(([y, c]) => `<div class="flex justify-between text-xs"><span>${y}년</span><span class="font-medium">${c}</span></div>`).join('')}</div>
+        </div>
+        <div class="col-span-2 md:col-span-4 bg-gray-50 rounded p-3">
+          <div class="text-xs text-gray-500 mb-2">Top 5 감사인</div>
+          <div class="flex flex-wrap gap-2">${topAuditors.map(([a, c]) => `<span class="badge badge-blue">${escapeHtml(a)} (${c})</span>`).join('')}</div>
+        </div>
+      `;
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 4. 검색 히스토리 & 즐겨찾기 ──
+    // ══════════════════════════════════════════════════
+    const HISTORY_KEY = 'dart_search_history';
+    const FAVORITES_KEY = 'dart_search_favorites';
+    const MAX_HISTORY = 20;
+
+    function getHistory() {
+      try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; }
+      catch { return []; }
+    }
+
+    function saveToHistory(keyword, corpName) {
+      if (!keyword && !corpName) return;
+      const history = getHistory();
+      const entry = { keyword: keyword || '', corpName: corpName || '', date: new Date().toISOString() };
+      const exists = history.findIndex(h => h.keyword === entry.keyword && h.corpName === entry.corpName);
+      if (exists >= 0) history.splice(exists, 1);
+      history.unshift(entry);
+      if (history.length > MAX_HISTORY) history.pop();
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+      renderHistoryPanel();
+    }
+
+    function getFavorites() {
+      try { return JSON.parse(localStorage.getItem(FAVORITES_KEY)) || []; }
+      catch { return []; }
+    }
+
+    function addFavorite(keyword, corpName) {
+      const favs = getFavorites();
+      if (favs.some(f => f.keyword === keyword && f.corpName === corpName)) return;
+      favs.unshift({ keyword, corpName, date: new Date().toISOString() });
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify(favs));
+      renderHistoryPanel();
+    }
+
+    function removeFavorite(idx) {
+      const favs = getFavorites();
+      favs.splice(idx, 1);
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify(favs));
+      renderHistoryPanel();
+    }
+
+    function clearHistory() {
+      localStorage.removeItem(HISTORY_KEY);
+      renderHistoryPanel();
+    }
+
+    function applyHistoryItem(keyword, corpName) {
+      document.getElementById('keywordInput').value = keyword || '';
+      document.getElementById('corpNameInput').value = corpName || '';
+      doSearch(1);
+    }
+
+    function renderHistoryPanel() {
+      const panel = document.getElementById('historyPanel');
+      if (!panel) return;
+      const history = getHistory();
+      const favs = getFavorites();
+
+      let html = '';
+      if (favs.length > 0) {
+        html += '<div class="mb-3"><div class="text-xs font-medium text-gray-600 mb-1.5">즐겨찾기</div>';
+        html += favs.map((f, i) => `
+          <div class="flex items-center gap-1 text-xs py-0.5 group">
+            <button onclick="applyHistoryItem('${escapeAttr(f.keyword)}','${escapeAttr(f.corpName)}')" class="text-blue-600 hover:underline truncate flex-1 text-left">${escapeHtml(f.keyword || f.corpName)}${f.keyword && f.corpName ? ' · ' + escapeHtml(f.corpName) : ''}</button>
+            <button onclick="removeFavorite(${i})" class="text-gray-300 hover:text-red-400 opacity-0 group-hover:opacity-100">✕</button>
+          </div>
+        `).join('');
+        html += '</div>';
+      }
+
+      if (history.length > 0) {
+        html += '<div><div class="flex items-center justify-between mb-1.5"><span class="text-xs font-medium text-gray-600">최근 검색</span><button onclick="clearHistory()" class="text-xs text-gray-400 hover:text-red-400">전체삭제</button></div>';
+        html += history.slice(0, 10).map(h => `
+          <div class="flex items-center gap-1 text-xs py-0.5 group">
+            <button onclick="applyHistoryItem('${escapeAttr(h.keyword)}','${escapeAttr(h.corpName)}')" class="text-gray-600 hover:text-blue-600 truncate flex-1 text-left">${escapeHtml(h.keyword || h.corpName)}${h.keyword && h.corpName ? ' · ' + escapeHtml(h.corpName) : ''}</button>
+            <button onclick="addFavorite('${escapeAttr(h.keyword)}','${escapeAttr(h.corpName)}')" class="text-gray-300 hover:text-yellow-500 opacity-0 group-hover:opacity-100" title="즐겨찾기 추가">☆</button>
+          </div>
+        `).join('');
+        html += '</div>';
+      }
+
+      if (!html) html = '<p class="text-xs text-gray-400">검색 기록이 없습니다.</p>';
+      panel.innerHTML = html;
+    }
+
+    function escapeAttr(str) {
+      return (str || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    }
+
+    function toggleHistoryPanel() {
+      const panel = document.getElementById('historyPanel');
+      if (panel.classList.contains('hidden')) {
+        renderHistoryPanel();
+        panel.classList.remove('hidden');
+      } else {
+        panel.classList.add('hidden');
+      }
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 5. 감사인 변경 추적 ──
+    // ══════════════════════════════════════════════════
+    function detectAuditorChanges() {
+      if (!currentResults || currentResults.length === 0) return;
+
+      const companyAuditors = {};
+      currentResults.forEach(r => {
+        const auditor = getAuditor(r);
+        if (!auditor || !r.company_name || !r.date) return;
+        const year = r.date.slice(0, 4);
+        if (!companyAuditors[r.company_name]) companyAuditors[r.company_name] = {};
+        if (!companyAuditors[r.company_name][year]) companyAuditors[r.company_name][year] = auditor;
+      });
+
+      const changes = [];
+      Object.entries(companyAuditors).forEach(([company, years]) => {
+        const sorted = Object.entries(years).sort((a, b) => a[0].localeCompare(b[0]));
+        for (let i = 1; i < sorted.length; i++) {
+          if (sorted[i][1] !== sorted[i-1][1]) {
+            changes.push({
+              company,
+              fromYear: sorted[i-1][0],
+              fromAuditor: sorted[i-1][1],
+              toYear: sorted[i][0],
+              toAuditor: sorted[i][1]
+            });
+          }
+        }
+      });
+
+      return changes;
+    }
+
+    function showAuditorChanges() {
+      const changes = detectAuditorChanges();
+      const panel = document.getElementById('auditorChangePanel');
+
+      if (!changes || changes.length === 0) {
+        panel.innerHTML = '<p class="text-xs text-gray-400">현재 검색결과 내에서 감사인 변경 이력이 감지되지 않았습니다.</p>';
+      } else {
+        panel.innerHTML = `
+          <div class="text-xs text-gray-600 mb-2">검색결과 내 감사인 변경: <strong>${changes.length}건</strong></div>
+          <div class="space-y-1.5 max-h-40 overflow-y-auto">
+            ${changes.map(c => `
+              <div class="flex items-center gap-2 text-xs bg-amber-50 rounded px-2 py-1.5">
+                <span class="font-medium text-gray-800">${escapeHtml(c.company)}</span>
+                <span class="text-gray-400">${c.fromYear}</span>
+                <span class="text-red-500">${escapeHtml(c.fromAuditor)}</span>
+                <span class="text-gray-400">→</span>
+                <span class="text-gray-400">${c.toYear}</span>
+                <span class="text-green-600">${escapeHtml(c.toAuditor)}</span>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      }
+
+      panel.classList.toggle('hidden');
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 6. 다중 키워드 파싱 (AND/OR/NOT) ──
+    // ══════════════════════════════════════════════════
+    function parseMultiKeyword(input) {
+      const trimmed = input.trim();
+      if (!trimmed) return null;
+
+      if (/\s+(AND|OR|NOT)\s+/i.test(trimmed)) {
+        const parts = trimmed.split(/\s+(AND|OR|NOT)\s+/i);
+        const keywords = [];
+        let currentOp = 'AND';
+
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i].trim();
+          if (/^(AND|OR|NOT)$/i.test(part)) {
+            currentOp = part.toUpperCase();
+          } else if (part) {
+            keywords.push({ term: part, op: currentOp });
+          }
+        }
+        return keywords.length > 0 ? keywords : null;
+      }
+
+      return null;
+    }
+
+    function filterResultsByMultiKeyword(results, keywords) {
+      if (!keywords) return results;
+
+      return results.filter(r => {
+        const text = `${r.report_name || ''} ${r.snippet || ''} ${r.company_name || ''}`.toLowerCase();
+        let include = true;
+
+        for (const kw of keywords) {
+          const found = text.includes(kw.term.toLowerCase());
+          if (kw.op === 'AND' && !found) { include = false; break; }
+          if (kw.op === 'NOT' && found) { include = false; break; }
+          if (kw.op === 'OR' && found) { include = true; }
+        }
+        return include;
+      });
+    }
+
+    // ══════════════════════════════════════════════════
+    // ── 7. API 키 미설정 안내 ──
+    // ══════════════════════════════════════════════════
+    function checkApiKeyStatus(response) {
+      if (response && response.error && /api.?key/i.test(response.error)) {
+        showApiKeyNotice();
+      }
+    }
+
+    function showApiKeyNotice() {
+      const existing = document.getElementById('apiKeyNotice');
+      if (existing) return;
+
+      const notice = document.createElement('div');
+      notice.id = 'apiKeyNotice';
+      notice.className = 'fixed top-4 right-4 max-w-sm bg-amber-50 border border-amber-300 rounded-lg p-4 shadow-lg z-50';
+      notice.innerHTML = `
+        <div class="flex items-start gap-2">
+          <svg class="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+          </svg>
+          <div>
+            <p class="text-sm font-medium text-amber-800">API 키가 설정되지 않았습니다</p>
+            <p class="text-xs text-amber-700 mt-1">서버의 <code class="bg-amber-100 px-1 rounded">.env</code> 파일에 <code class="bg-amber-100 px-1 rounded">DART_API_KEY=your_key</code>를 설정해주세요.</p>
+            <button onclick="this.closest('#apiKeyNotice').remove()" class="mt-2 text-xs text-amber-600 hover:text-amber-800 underline">닫기</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(notice);
+    }
+
+    // ── doSearch 훅: 히스토리 저장 + 멀티키워드 필터 ──
+    // DART에 AND 키워드 전부를 space-separated로 전달하면 DART가 자체 AND 필터를 적용해
+    // 모집단을 크게 줄여줍니다 (DART 본문검색은 공백 구분 다중 키워드를 AND로 처리).
+    // OR/NOT은 DART 호환성이 불확실해 클라이언트 측 필터로 유지합니다.
+    const _originalDoSearch = doSearch;
+    doSearch = async function(page, _retryCount) {
+      const keyword = document.getElementById('keywordInput').value.trim();
+      const corpName = document.getElementById('corpNameInput').value.trim();
+
+      const multiKw = parseMultiKeyword(keyword);
+      const dartKeyword = buildDartKeyword(keyword, multiKw);
+      if (dartKeyword !== keyword) {
+        document.getElementById('keywordInput').value = dartKeyword;
+      }
+
+      await _originalDoSearch(page, _retryCount);
+
+      if (dartKeyword !== keyword) {
+        document.getElementById('keywordInput').value = keyword;
+      }
+
+      if (currentResults && currentResults.length > 0) {
+        saveToHistory(keyword, corpName);
+
+        // DART가 AND를 처리했으므로 클라이언트에선 OR/NOT만 추가 검증
+        const clientKw = getClientSideMultiKw(multiKw);
+        if (clientKw) {
+          const filtered = filterResultsByMultiKeyword(currentResults, clientKw);
+          if (filtered.length < currentResults.length) {
+            currentResults = filtered;
+            renderResults(lastSearchData);
+            document.getElementById('totalCount').textContent =
+              `검색결과 ${filtered.length}건 (조건필터 적용)`;
+          }
+        }
+      }
+
+      // 감사인 필터 또는 감사본문 한정 모드가 활성이면 검색 완료 후 자동으로 전체 스캔 모드 진입
+      const auditorActive = !!document.getElementById('auditorNameInput').value.trim();
+      const auditOnlyActive = isAuditContentOnly();
+      if ((auditorActive || auditOnlyActive) && currentResults.length > 0) {
+        if (auditorActive) {
+          onAuditorFilterInput();
+        } else {
+          // audit-only만 켜진 경우: 스캔 시작 + 스캔 뷰 진입 (감사인 필터 없이)
+          if (!scanState && lastSearchData) ensureScan();
+          enterScanView();
+        }
+      }
+    };
 
   </script>
 </body>

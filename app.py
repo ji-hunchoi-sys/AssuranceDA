@@ -39,6 +39,10 @@ _xml_cache = {}
 _XML_CACHE_MAX = 30
 _XML_CACHE_TTL = 600
 
+# 감사보고서/연결감사보고서 섹션 본문 텍스트 캐시 (per rcept_no)
+_audit_text_cache = {}
+_AUDIT_TEXT_CACHE_MAX = 200
+
 # ── DART 웹 세션 ──
 _dart_session = None
 _dart_session_lock = threading.Lock()
@@ -49,22 +53,26 @@ _DART_SESSION_TTL = 600
 _last_api_call = 0.0
 _last_dart_call = 0.0
 API_CALL_INTERVAL = 0.35
+_api_rate_lock = threading.Lock()
+_dart_rate_lock = threading.Lock()
 
 
 def _rate_limit_api():
     global _last_api_call
-    elapsed = time.time() - _last_api_call
-    if elapsed < API_CALL_INTERVAL:
-        time.sleep(API_CALL_INTERVAL - elapsed)
-    _last_api_call = time.time()
+    with _api_rate_lock:
+        elapsed = time.time() - _last_api_call
+        if elapsed < API_CALL_INTERVAL:
+            time.sleep(API_CALL_INTERVAL - elapsed)
+        _last_api_call = time.time()
 
 
 def _rate_limit_dart():
     global _last_dart_call
-    elapsed = time.time() - _last_dart_call
-    if elapsed < API_CALL_INTERVAL:
-        time.sleep(API_CALL_INTERVAL - elapsed)
-    _last_dart_call = time.time()
+    with _dart_rate_lock:
+        elapsed = time.time() - _last_dart_call
+        if elapsed < API_CALL_INTERVAL:
+            time.sleep(API_CALL_INTERVAL - elapsed)
+        _last_dart_call = time.time()
 
 
 def _create_dart_session():
@@ -135,6 +143,11 @@ def _search_dart(keyword, start_date, end_date, page=1, max_results=15,
     """DART 본문검색을 수행한다. 실패 시 세션을 재생성하여 1회 재시도."""
     corp_cik = _lookup_corp_cik(corp_name) if corp_name else ""
 
+    # 멀티 키워드(공백으로 분리된 2개 이상)일 때는 synonym 확장을 끄고 body-only 옵션을 명시해
+    # DART가 더 strict한 AND 매칭을 하도록 유도한다. 단일 키워드일 때는 기존 동작(synonym=Y) 유지.
+    keyword_parts = keyword.strip().split()
+    is_multi_kw = len(keyword_parts) > 1
+
     form_data = {
         "currentPage": str(page),
         "maxResults": str(max_results),
@@ -142,7 +155,7 @@ def _search_dart(keyword, start_date, end_date, page=1, max_results=15,
         "sort": "",
         "sortType": "",
         "keyword": keyword,
-        "synonym": "Y",
+        "synonym": "N" if is_multi_kw else "Y",
         "textCrpNm": corp_name,
         "textCrpCik": corp_cik,
         "textPresenterNm": "",
@@ -151,7 +164,7 @@ def _search_dart(keyword, start_date, end_date, page=1, max_results=15,
         "docType": "",
         "reportName": "",
         "autoSearch": "N",
-        "option": "",
+        "option": "contents" if is_multi_kw else "",
         "tocSrch": "",
     }
     if dsp_types:
@@ -437,6 +450,54 @@ def _extract_section_html(xml_content, sections, section_index):
     return xml_content[start:end]
 
 
+# ── 감사보고서 본문 추출 ──
+
+def _extract_audit_section_text(xml_content):
+    """XML에서 감사보고서/연결감사보고서 섹션의 텍스트만 분리 추출한다."""
+    sections = _extract_sections_from_xml(xml_content)
+
+    audit_html_chunks = []
+    consolidated_html_chunks = []
+
+    for sec in sections:
+        title_clean = sec["title"].replace(" ", "")
+        if "연결감사보고서" in title_clean:
+            consolidated_html_chunks.append(_extract_section_html(xml_content, sections, sec["index"]))
+        elif "감사보고서" in title_clean and "내부회계" not in title_clean and "감사의감사" not in title_clean:
+            audit_html_chunks.append(_extract_section_html(xml_content, sections, sec["index"]))
+
+    def _to_text(chunks):
+        if not chunks:
+            return ""
+        joined = " ".join(chunks)
+        # 태그 제거 → 공백 정규화
+        text = re.sub(r"<[^>]+>", " ", joined)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    return {
+        "audit": _to_text(audit_html_chunks),
+        "consolidated": _to_text(consolidated_html_chunks),
+    }
+
+
+def _get_audit_text(rcept_no):
+    """감사/연결감사 섹션 텍스트를 캐시 사용해 반환."""
+    if rcept_no in _audit_text_cache:
+        return _audit_text_cache[rcept_no]
+    try:
+        xml_content = _download_document_xml(rcept_no)
+        result = _extract_audit_section_text(xml_content)
+    except Exception as exc:
+        logger.warning("감사보고서 본문 추출 실패 (rcept_no=%s): %s", rcept_no, exc)
+        result = {"audit": "", "consolidated": ""}
+
+    if len(_audit_text_cache) >= _AUDIT_TEXT_CACHE_MAX:
+        _audit_text_cache.pop(next(iter(_audit_text_cache)))
+    _audit_text_cache[rcept_no] = result
+    return result
+
+
 # ── Flask 라우트 ──
 
 @app.errorhandler(400)
@@ -594,6 +655,7 @@ def search():
     page = flask_request.args.get("page", "1")
     max_results = flask_request.args.get("max_results", "15")
     dsp_type = flask_request.args.get("dsp_type", "A,F")
+    scan_mode = flask_request.args.get("scan", "").lower() in ("1", "true", "yes")
 
     if not start_date:
         start_date = (datetime.now() - timedelta(days=1095)).strftime("%Y%m%d")
@@ -636,16 +698,30 @@ def search():
                     break
 
             deduped = _deduplicate_results(all_results)
-            has_more = len(deduped) > max_num or data["page_info"]["has_next"]
-            data = {
-                "results": deduped[:max_num],
-                "page_info": {
-                    "total": len(deduped),
-                    "has_next": has_more,
-                    "has_prev": page_num > 1,
-                    "total_pages": total_info.get("total_pages", 0) if total_info else 0,
+            if scan_mode:
+                # 스캔 모드: 한 호출에 5 DART 페이지(최대 ~500건) 전부 반환
+                # 페이지네이션은 우리 page 단위(=DART 5페이지) 그대로 유지
+                last_page_info = data["page_info"]
+                data = {
+                    "results": deduped,
+                    "page_info": {
+                        "total": last_page_info.get("total", len(deduped)),
+                        "has_next": last_page_info.get("has_next", False),
+                        "has_prev": page_num > 1,
+                        "total_pages": total_info.get("total_pages", 0) if total_info else 0,
+                    }
                 }
-            }
+            else:
+                has_more = len(deduped) > max_num or data["page_info"]["has_next"]
+                data = {
+                    "results": deduped[:max_num],
+                    "page_info": {
+                        "total": len(deduped),
+                        "has_next": has_more,
+                        "has_prev": page_num > 1,
+                        "total_pages": total_info.get("total_pages", 0) if total_info else 0,
+                    }
+                }
         else:
             data = _list_filings(
                 corp_name=corp_name,
@@ -689,7 +765,7 @@ def extract_auditors():
     if not rcept_nos or not isinstance(rcept_nos, list):
         return jsonify({"error": "rcept_nos 배열이 필요합니다."}), 400
 
-    rcept_nos = rcept_nos[:5]
+    rcept_nos = rcept_nos[:20]
     result = {}
     for rcept_no in rcept_nos:
         if not rcept_no or not str(rcept_no).isdigit():
@@ -709,6 +785,51 @@ def extract_auditor_single(rcept_no):
         return jsonify({"error": "유효하지 않은 접수번호입니다."}), 400
     auditor = _extract_auditor(rcept_no)
     return jsonify({"rcept_no": rcept_no, "auditor": auditor})
+
+
+@app.route("/api/check-audit-content", methods=["POST"])
+def check_audit_content():
+    """주어진 키워드들이 (감사보고서|연결감사보고서) 섹션 본문에 모두 포함되는지 검증."""
+    body = flask_request.get_json(silent=True) or {}
+    rcept_nos = body.get("rcept_nos", [])
+    keywords = body.get("keywords", [])
+
+    if not rcept_nos or not isinstance(rcept_nos, list):
+        return jsonify({"error": "rcept_nos 배열이 필요합니다."}), 400
+    if not isinstance(keywords, list):
+        keywords = []
+
+    rcept_nos = rcept_nos[:20]
+    keywords = [str(k).strip() for k in keywords if str(k).strip()]
+
+    result = {}
+    for rcept_no in rcept_nos:
+        rcept_str = str(rcept_no)
+        if not rcept_str.isdigit():
+            continue
+        text_dict = _get_audit_text(rcept_str)
+        audit_text = text_dict.get("audit", "")
+        consol_text = text_dict.get("consolidated", "")
+
+        # 키워드 모두 포함 여부 (대소문자 무시)
+        def _all_in(text, kws):
+            if not kws:
+                return bool(text)
+            tl = text.lower()
+            return all(kw.lower() in tl for kw in kws)
+
+        in_audit = _all_in(audit_text, keywords) if audit_text else False
+        in_consolidated = _all_in(consol_text, keywords) if consol_text else False
+
+        result[rcept_str] = {
+            "in_audit": in_audit,
+            "in_consolidated": in_consolidated,
+            "matched": in_audit or in_consolidated,
+            "has_audit_section": bool(audit_text),
+            "has_consolidated_section": bool(consol_text),
+        }
+
+    return jsonify({"results": result})
 
 
 @app.route("/api/document/<rcept_no>")
