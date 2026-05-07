@@ -1,0 +1,6 @@
+# 테스트 샘플 생성/검증 도구 의존성
+openpyxl       # Excel 샘플 생성/읽기
+reportlab      # PDF 샘플 생성
+Pillow         # PNG 샘플 생성
+pdfplumber     # PDF 텍스트 추출 (시뮬레이터용)
+playwright     # E2E 브라우저 자동 테스트

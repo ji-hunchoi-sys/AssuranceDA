@@ -255,12 +255,21 @@
             </div>
 
             <div class="upload-grid">
-                <div class="upload-box" id="fundUploadBox" role="button" tabindex="0" onclick="document.getElementById('fundFileInput').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('fundFileInput').click();}">
-                    <div class="upload-icon">📋</div>
-                    <h4>자금일보 (검증 대상)</h4>
-                    <p>PDF, Excel 또는 이미지 파일을 드래그하거나 클릭하세요</p>
-                    <p style="margin-top:8px; font-size:11px; color:var(--text-light);">지원: PDF, Excel(.xlsx, .xls), CSV, 이미지(PNG, JPG)</p>
-                    <input type="file" id="fundFileInput" accept=".pdf,.xlsx,.xls,.csv,.png,.jpg,.jpeg,.bmp,.tiff,.tif" style="display:none">
+                <div>
+                    <div class="upload-box" id="fundUploadBox" role="button" tabindex="0" onclick="document.getElementById('fundFileInput').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('fundFileInput').click();}">
+                        <div class="upload-icon">📋</div>
+                        <h4>자금일보 (검증 대상)</h4>
+                        <p>PDF, Excel 또는 이미지 파일을 드래그하거나 클릭하세요</p>
+                        <p style="margin-top:8px; font-size:11px; color:var(--text-light);">지원: PDF, Excel(.xlsx, .xls), CSV, 이미지(PNG, JPG)</p>
+                        <input type="file" id="fundFileInput" accept=".pdf,.xlsx,.xls,.csv,.png,.jpg,.jpeg,.bmp,.tiff,.tif" style="display:none">
+                    </div>
+                    <div id="fundOcrDebugPanel" class="hidden" style="margin-top:8px; padding:10px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); max-height:240px; overflow-y:auto; text-align:left;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                            <span style="font-size:12px; font-weight:600;">📝 자금일보 OCR/파싱 결과</span>
+                            <button onclick="event.stopPropagation();document.getElementById('fundOcrDebugPanel').classList.add('hidden')" style="background:none; border:none; cursor:pointer; font-size:12px; color:var(--text-secondary);">✕ 닫기</button>
+                        </div>
+                        <pre id="fundOcrDebugText" style="font-size:11px; white-space:pre-wrap; word-break:break-all; color:var(--text-secondary); line-height:1.5;"></pre>
+                    </div>
                 </div>
                 <div>
                     <div class="upload-box" id="bankUploadBox" role="button" tabindex="0" onclick="document.getElementById('bankFileInput').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('bankFileInput').click();}">
@@ -610,6 +619,41 @@ if (typeof pdfjsLib !== 'undefined') {
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 }
 
+// PDF 텍스트 추출 — 줄(Y좌표) 단위로 그룹핑하여 표 구조 보존
+// 기본 join(' ')은 모든 텍스트를 한 줄로 합쳐버려 자금일보처럼 행 단위가 중요한 문서에서 파싱 실패
+async function extractPdfTextLineAware(pdfFile) {
+    const buf = await pdfFile.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    let allText = '';
+    for (let p = 1; p <= pdf.numPages; p++) {
+        const page = await pdf.getPage(p);
+        const tc = await page.getTextContent();
+        // Y좌표(transform[5])로 그룹핑, 동일 Y는 한 줄
+        const tolerance = 2; // 같은 줄로 보는 Y 오차
+        const lines = []; // [{y, items: [{x, str}, ...]}]
+        for (const item of tc.items) {
+            if (!item.str || !item.transform) continue;
+            const y = item.transform[5];
+            const x = item.transform[4];
+            let bucket = lines.find(l => Math.abs(l.y - y) <= tolerance);
+            if (!bucket) {
+                bucket = { y, items: [] };
+                lines.push(bucket);
+            }
+            bucket.items.push({ x, str: item.str });
+        }
+        // Y 내림차순(위→아래), X 오름차순(왼→오)
+        lines.sort((a, b) => b.y - a.y);
+        for (const l of lines) {
+            l.items.sort((a, b) => a.x - b.x);
+            const lineText = l.items.map(it => it.str).join(' ').replace(/\s+/g, ' ').trim();
+            if (lineText) allText += lineText + '\n';
+        }
+        if (p < pdf.numPages) allText += '\n';
+    }
+    return allText;
+}
+
 // =========================================================
 // UI Helpers
 // =========================================================
@@ -701,11 +745,11 @@ function onOpenCvFail() {
 }
 
 // ── 이미지 전처리 파이프라인 (OpenCV.js) ──
-async function preprocessImage(file) {
+async function preprocessImage(file, mode = 'light') {
     if (!cvLoaded) return file;
 
     const loadingEl = document.getElementById('loadingText');
-    loadingEl.textContent = '이미지 전처리 중 (대비 강화, 이진화)...';
+    loadingEl.textContent = '이미지 전처리 중...';
 
     return new Promise((resolve) => {
         const img = new Image();
@@ -734,36 +778,40 @@ async function preprocessImage(file) {
                 cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
                 src.delete();
 
-                // 3. 대비 강화 (정규화 + 히스토그램 평활화)
-                const enhanced = new cv.Mat();
-                cv.equalizeHist(gray, enhanced);
-                gray.delete();
+                let output;
+                if (mode === 'heavy') {
+                    // heavy 모드: 스캔/사진 등 노이즈가 많은 이미지용
+                    const enhanced = new cv.Mat();
+                    cv.equalizeHist(gray, enhanced);
+                    gray.delete();
 
-                // 4. 가우시안 블러 (노이즈 제거)
-                const blurred = new cv.Mat();
-                cv.GaussianBlur(enhanced, blurred, new cv.Size(3, 3), 0);
-                enhanced.delete();
+                    const blurred = new cv.Mat();
+                    cv.GaussianBlur(enhanced, blurred, new cv.Size(3, 3), 0);
+                    enhanced.delete();
 
-                // 5. 적응형 이진화 (Adaptive Threshold)
-                const binary = new cv.Mat();
-                cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 15, 10);
-                blurred.delete();
-
-                // 6. 모폴로지 연산 (작은 노이즈 점 제거)
-                const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(2, 2));
-                const cleaned = new cv.Mat();
-                cv.morphologyEx(binary, cleaned, cv.MORPH_CLOSE, kernel);
-                binary.delete();
-                kernel.delete();
+                    const binary = new cv.Mat();
+                    cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 15);
+                    blurred.delete();
+                    output = binary;
+                } else {
+                    // light 모드 (기본): 스크린샷/깨끗한 이미지용 — 샤프닝만 적용
+                    const sharpened = new cv.Mat();
+                    const blurred = new cv.Mat();
+                    cv.GaussianBlur(gray, blurred, new cv.Size(0, 0), 3);
+                    cv.addWeighted(gray, 1.5, blurred, -0.5, 0, sharpened);
+                    gray.delete();
+                    blurred.delete();
+                    output = sharpened;
+                }
 
                 // 결과를 Canvas → Blob으로 변환
                 const outCanvas = document.createElement('canvas');
-                cv.imshow(outCanvas, cleaned);
-                cleaned.delete();
+                cv.imshow(outCanvas, output);
+                output.delete();
 
                 outCanvas.toBlob((blob) => {
                     if (blob) {
-                        console.log('[전처리] 완료 — 전처리 이미지 크기:', (blob.size / 1024).toFixed(0), 'KB');
+                        console.log(`[전처리] 완료 (${mode}) — 크기:`, (blob.size / 1024).toFixed(0), 'KB');
                         resolve(blob);
                     } else {
                         resolve(file);
@@ -779,35 +827,82 @@ async function preprocessImage(file) {
     });
 }
 
-// ── OCR 실행 ──
+// ── OCR 품질 검증 ──
+function ocrQualityScore(text) {
+    if (!text || text.length < 10) return 0;
+    const korCount = (text.match(/[가-힣]/g) || []).length;
+    const numCount = (text.match(/\d/g) || []).length;
+    const totalChars = text.replace(/\s/g, '').length;
+    if (totalChars === 0) return 0;
+    return (korCount + numCount) / totalChars;
+}
+
+// ── OCR 실행 (품질 미달 시 원본으로 재시도) ──
 async function ocrImage(file) {
     if (typeof Tesseract === 'undefined') throw new Error('OCR 라이브러리(Tesseract.js)를 로드하지 못했습니다. 인터넷 연결을 확인하세요.');
 
-    // OpenCV 로드 대기 (최대 5초)
     const cvTimeout = new Promise(resolve => setTimeout(() => resolve(false), 5000));
     const cvStatus = await Promise.race([cvReady, cvTimeout]);
 
-    // 이미지 전처리
+    async function runOCR(input) {
+        const worker = await Tesseract.createWorker('kor+eng', 1, {
+            logger: m => {
+                if (m.status === 'recognizing text') {
+                    const pct = Math.round((m.progress || 0) * 100);
+                    document.getElementById('loadingText').textContent = `OCR 텍스트 인식 중... ${pct}%`;
+                }
+            }
+        });
+        const { data } = await worker.recognize(input);
+        await worker.terminate();
+        return data.text;
+    }
+
+    // 1차 시도: light 전처리 (샤프닝만)
     let imageInput = file;
     if (cvStatus && cvLoaded) {
         try {
-            imageInput = await preprocessImage(file);
+            imageInput = await preprocessImage(file, 'light');
         } catch (e) {
             console.warn('[OCR] 전처리 실패, 원본 사용:', e);
         }
     }
 
-    const worker = await Tesseract.createWorker('kor+eng', 1, {
-        logger: m => {
-            if (m.status === 'recognizing text') {
-                const pct = Math.round((m.progress || 0) * 100);
-                document.getElementById('loadingText').textContent = `OCR 텍스트 인식 중... ${pct}%`;
-            }
+    let text = await runOCR(imageInput);
+    let score = ocrQualityScore(text);
+    console.log(`[OCR] 1차(light) 품질: ${(score * 100).toFixed(1)}%, 길이: ${text.length}`);
+
+    // 품질이 낮으면 원본 이미지로 재시도
+    if (score < 0.3 && imageInput !== file) {
+        console.log('[OCR] 품질 미달 → 원본 이미지로 재시도');
+        document.getElementById('loadingText').textContent = 'OCR 재시도 (원본 이미지)...';
+        const rawText = await runOCR(file);
+        const rawScore = ocrQualityScore(rawText);
+        console.log(`[OCR] 2차(원본) 품질: ${(rawScore * 100).toFixed(1)}%, 길이: ${rawText.length}`);
+        if (rawScore > score) {
+            text = rawText;
+            score = rawScore;
         }
-    });
-    const { data } = await worker.recognize(imageInput);
-    await worker.terminate();
-    return data.text;
+    }
+
+    // 여전히 품질이 낮으면 heavy 전처리로 마지막 시도
+    if (score < 0.3 && cvStatus && cvLoaded) {
+        console.log('[OCR] 여전히 품질 미달 → heavy 전처리로 재시도');
+        document.getElementById('loadingText').textContent = 'OCR 재시도 (고대비 처리)...';
+        try {
+            const heavyInput = await preprocessImage(file, 'heavy');
+            const heavyText = await runOCR(heavyInput);
+            const heavyScore = ocrQualityScore(heavyText);
+            console.log(`[OCR] 3차(heavy) 품질: ${(heavyScore * 100).toFixed(1)}%, 길이: ${heavyText.length}`);
+            if (heavyScore > score) {
+                text = heavyText;
+            }
+        } catch (e) {
+            console.warn('[OCR] heavy 전처리 실패:', e);
+        }
+    }
+
+    return text;
 }
 
 const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'];
@@ -821,19 +916,16 @@ async function handleFundFile(file) {
 
     showLoading('자금일보 파일 분석 중...');
     try {
+        let fundDebugText = null;
         if (IMAGE_EXTS.includes(ext)) {
             const text = await ocrImage(file);
+            console.log('[자금일보 OCR 원본 텍스트]', text);
+            fundDebugText = text;
             APP.fundData = parseFundReport(text);
         } else if (ext === 'pdf') {
             if (typeof pdfjsLib === 'undefined') { showToast('PDF.js를 로드하지 못했습니다', 'error'); hideLoading(); return; }
-            const buf = await file.arrayBuffer();
-            const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-            let text = '';
-            for (let i = 1; i <= pdf.numPages; i++) {
-                const page = await pdf.getPage(i);
-                const tc = await page.getTextContent();
-                text += tc.items.map(it => it.str).join(' ') + '\n';
-            }
+            const text = await extractPdfTextLineAware(file);
+            fundDebugText = text;
             APP.fundData = parseFundReport(text);
         } else {
             if (typeof XLSX === 'undefined') { showToast('Excel 라이브러리를 로드하지 못했습니다', 'error'); hideLoading(); return; }
@@ -849,6 +941,31 @@ async function handleFundFile(file) {
         fundBox.innerHTML = `<div class="file-badge">업로드 완료</div><div class="upload-icon">✅</div><h4>${escapeHtml(file.name)}</h4><p>${APP.fundData.transactions.length}건의 거래 감지됨${ocrLabel}</p>`;
         fundBox.appendChild(fundInput);
         fundBox.onclick = () => fundInput.click();
+
+        // 디버그 패널: OCR 원문 + 파싱된 수입/지출 합계 + 항목 목록
+        if (fundDebugText) {
+            const dPanel = document.getElementById('fundOcrDebugPanel');
+            const dText = document.getElementById('fundOcrDebugText');
+            if (dPanel && dText) {
+                dPanel.classList.remove('hidden');
+                const t = APP.fundData.totals || {};
+                const txList = (APP.fundData.transactions || []).map((tx, i) => {
+                    const dir = tx.deposit > 0 ? `수입 ${tx.deposit.toLocaleString()}원` : `지출 ${tx.withdrawal.toLocaleString()}원`;
+                    return `${i+1}. [${dir}] ${tx.account || tx.description}`;
+                }).join('\n');
+                dText.textContent =
+                    `=== 자금일보 OCR/파싱 요약 ===\n` +
+                    `날짜: ${APP.fundData.date || '미인식'}\n` +
+                    `기초시재: ${(t.openingBalance||0).toLocaleString()}원\n` +
+                    `마감시재: ${(t.closingBalance||0).toLocaleString()}원\n` +
+                    `총 수입(입금): ${(t.totalIncome||0).toLocaleString()}원\n` +
+                    `총 지출(출금): ${(t.totalExpense||0).toLocaleString()}원\n` +
+                    `총 조달: ${(t.totalFunding||0).toLocaleString()}원\n\n` +
+                    `=== 분류된 항목 (${(APP.fundData.transactions||[]).length}건) ===\n${txList || '(없음)'}\n\n` +
+                    `=== OCR/PDF 원문 (${fundDebugText.length}자) ===\n${fundDebugText}`;
+            }
+        }
+
         checkReady();
         if (APP.fundData.transactions.length === 0) {
             showToast('자금일보에서 거래를 감지하지 못했습니다. 파일 형식을 확인하세요.', 'warning');
@@ -887,14 +1004,7 @@ async function handleBankFile(file) {
             if (rows.length === 0) showToast('이미지에서 거래를 감지하지 못했습니다. 선명한 이미지를 사용하세요.', 'warning');
         } else if (ext === 'pdf') {
             if (typeof pdfjsLib === 'undefined') { showToast('PDF.js를 로드하지 못했습니다', 'error'); hideLoading(); return; }
-            const buf = await file.arrayBuffer();
-            const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-            let text = '';
-            for (let i = 1; i <= pdf.numPages; i++) {
-                const page = await pdf.getPage(i);
-                const tc = await page.getTextContent();
-                text += tc.items.map(it => it.str).join(' ') + '\n';
-            }
+            const text = await extractPdfTextLineAware(file);
             const parsed = parseBankPDF(text);
             headers = parsed.headers;
             rows = parsed.rows;
@@ -947,7 +1057,12 @@ function autoDetectMapping(headers) {
 
 function parseBankRows(rows, mapping, bankLabel) {
     const transactions = [];
+    const summaryPattern = /합\s*계|총\s*계|소\s*계|^\s*total\s*$|^\s*subtotal\s*$|이월|이전잔액/i;
     for (const row of rows) {
+        // 합계/소계 행은 거래가 아니므로 제외 (입금/출금이 모두 있는 합계 행이 거래로 잡혀 합계가 2배 되는 문제 방지)
+        const rowText = row.map(c => String(c == null ? '' : c)).join(' ');
+        if (summaryPattern.test(rowText)) continue;
+
         const deposit = mapping.deposit >= 0 ? parseAmount(row[mapping.deposit]) : 0;
         const withdrawal = mapping.withdrawal >= 0 ? parseAmount(row[mapping.withdrawal]) : 0;
         if (deposit === 0 && withdrawal === 0) continue;
@@ -1071,15 +1186,35 @@ function parseFundExcel(raw) {
     const result = { transactions: [], date: null, totals: {} };
     if (!raw || raw.length < 2) return result;
 
-    // Find header row
-    let headerIdx = 0;
-    for (let i = 0; i < Math.min(raw.length, 10); i++) {
-        const row = raw[i].map(c => String(c).trim().toLowerCase());
-        const hasKeyword = row.some(c => c.includes('잔액') || c.includes('입금') || c.includes('출금') || c.includes('전일') || c.includes('당일'));
-        if (hasKeyword) { headerIdx = i; break; }
-        const nonEmpty = raw[i].filter(c => String(c).trim()).length;
-        if (nonEmpty >= 4 && i > 0) { headerIdx = i; break; }
+    // Find header row — 키워드 매칭을 우선시한다.
+    // 진짜 헤더 행은 여러 셀에 컬럼명 키워드가 분포되어 있고(예: "구분 | 항목 | 입금 | 출금 | 비고"),
+    // 메타 행은 한두 셀에만 우연히 키워드가 들어간다(예: "전일이월 현금시재 | 100,000,000 | ...").
+    // 따라서 키워드 매칭 셀 수가 가장 많은 행을 헤더로 선택한다.
+    const headerKwRe = /잔액|잔고|입금|출금|수입|지출|차변|대변|전일|당일|기초|기말|구\s*분|항\s*목|계\s*정|계\s*좌|적\s*요|비\s*고/;
+    let headerIdx = -1;
+    let bestKwCount = 0;
+    for (let i = 0; i < Math.min(raw.length, 15); i++) {
+        const cells = raw[i].map(c => String(c == null ? '' : c).trim().toLowerCase());
+        // 짧은 셀(컬럼명스러운 것)에서만 카운트 — 긴 텍스트나 숫자에서 우연히 매칭되는 것 배제
+        let kwCount = 0;
+        for (const c of cells) {
+            if (!c || c.length > 20) continue;
+            if (/^\d[\d,. ]*$/.test(c)) continue; // 숫자 셀 제외
+            if (headerKwRe.test(c)) kwCount++;
+        }
+        if (kwCount > bestKwCount) {
+            bestKwCount = kwCount;
+            headerIdx = i;
+        }
     }
+    // 강한 헤더 단서가 없으면(키워드 셀 2개 미만) "4셀 이상 채워진 첫 행" 폴백
+    if (headerIdx < 0 || bestKwCount < 2) {
+        for (let i = 0; i < Math.min(raw.length, 10); i++) {
+            const nonEmpty = raw[i].filter(c => c != null && String(c).trim()).length;
+            if (nonEmpty >= 4 && i > 0) { headerIdx = i; break; }
+        }
+    }
+    if (headerIdx < 0) headerIdx = 0;
 
     const headers = raw[headerIdx].map(h => String(h).trim().toLowerCase());
 
@@ -1117,9 +1252,10 @@ function parseFundExcel(raw) {
     }
     if (colAccount < 0) colAccount = 0;
 
-    // Extract date from first few rows
-    for (let i = 0; i < Math.min(headerIdx, 5); i++) {
-        const rowText = raw[i].join(' ');
+    // Extract date from metadata rows (헤더 행 위쪽 — 헤더가 0행이면 헤더 자체도 포함)
+    const dateScanEnd = Math.max(headerIdx, 1);
+    for (let i = 0; i < Math.min(dateScanEnd, 6); i++) {
+        const rowText = raw[i].map(c => c == null ? '' : c).join(' ');
         const dm = rowText.match(/(\d{4})[.\-\/년]\s*(\d{1,2})[.\-\/월]\s*(\d{1,2})/);
         if (dm) { result.date = `${dm[1]}-${String(dm[2]).padStart(2,'0')}-${String(dm[3]).padStart(2,'0')}`; break; }
     }
@@ -1163,8 +1299,11 @@ function parseBankPDF(text) {
     const lines = text.split('\n');
 
     // 1단계: 각 줄에서 날짜와 모든 금액 후보를 추출
-    const datePattern = /(\d{4}[.\-\/]\d{1,2}[.\-\/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/;
-    const datePatternShort = /(\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/;
+    // OCR이 시간을 날짜에 붙여 읽는 경우 ("2024-11-1116:29:29" 또는 "2024-11-11162929") 대응
+    const datePattern = /(\d{4}[.\-\/]\d{1,2}[.\-\/]\d{1,2})(\s*\d{1,2}[:.\s]?\d{2}[:.\s]?\d{2})?/;
+    const datePatternShort = /(\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2})(\s*\d{1,2}[:.\s]?\d{2}[:.\s]?\d{2})?/;
+    // 날짜 직후 6자리 시간(HHMMSS) — OCR이 콜론을 지운 케이스 ("2024-11-11162929")
+    const stuckTimestamp = /^(\d{6})(?=\D|$)/;
 
     const rawEntries = [];
 
@@ -1177,7 +1316,7 @@ function parseBankPDF(text) {
         let dateMatch = trimmed.match(datePattern) || trimmed.match(datePatternShort);
         if (!dateMatch) continue;
 
-        let dateStr = dateMatch[1].replace(/\s+\d{1,2}:\d{2}(:\d{2})?/, '').trim();
+        let dateStr = dateMatch[1].trim();
         if (dateStr.match(/^\d{2}[.\-\/]/)) dateStr = '20' + dateStr;
         dateStr = dateStr.replace(/[.\/]/g, '-');
 
@@ -1194,35 +1333,51 @@ function parseBankPDF(text) {
             if (mon < 1 || mon > 12 || day < 1 || day > 31) continue;
         }
 
-        // 날짜 이후 텍스트에서 금액 추출
-        const afterDate = trimmed.substring(trimmed.indexOf(dateMatch[1]) + dateMatch[1].length);
-        const amounts = [];
-        const numRegex = /([\d,]+)/g;
-        let m;
-        while ((m = numRegex.exec(afterDate)) !== null) {
-            const raw = m[0];
-            const num = parseInt(raw.replace(/,/g, ''), 10);
-            if (isNaN(num) || num <= 0) continue;
-            const digits = raw.replace(/,/g, '').length;
+        // 날짜 (그리고 시간이 있다면) 이후 텍스트만 추출
+        // dateMatch[2]에 시간 부분이 들어있을 수 있음 (정상 콜론/공백 포함)
+        const fullDateMatchLen = dateMatch[1].length + (dateMatch[2] ? dateMatch[2].length : 0);
+        let afterDate = trimmed.substring(trimmed.indexOf(dateMatch[1]) + fullDateMatchLen);
 
-            if (raw.includes(',')) {
-                // 콤마가 있는 숫자: 한국 금액 형식 검증 (3자리마다 콤마)
-                // 예: "14,630,000" ✓  "8059,0104" ✗
-                const commaValid = /^(\d{1,3})(,\d{3})+$/.test(raw);
-                if (commaValid && digits <= 12) {
-                    amounts.push(num);
-                }
-            } else {
-                // 콤마 없는 숫자: 9자리 이하만 금액으로 인정
-                // 10자리 이상 콤마없음 = 계좌번호/관리번호 (예: 22278091780, 09622007638)
-                if (digits >= 4 && digits <= 9) {
-                    amounts.push(num);
-                }
+        // OCR이 콜론을 지운 시간(HHMMSS 6자리)이 날짜 직후에 붙어있으면 제거
+        // 예: "2024-11-11162929 14,630,000 ..." → "162929"가 시간 → 제거 후 "14,630,000 ..."만 남김
+        const tsMatch = afterDate.replace(/^[\s\|]+/, '').match(stuckTimestamp);
+        if (tsMatch) {
+            const ts = tsMatch[1];
+            const hh = parseInt(ts.substring(0, 2));
+            const mm = parseInt(ts.substring(2, 4));
+            const ss = parseInt(ts.substring(4, 6));
+            // 유효한 시간 범위면 제거 (HHMMSS 형식이 시간으로 해석 가능한 경우)
+            if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 && ss >= 0 && ss <= 59) {
+                const idx = afterDate.search(stuckTimestamp);
+                if (idx >= 0) afterDate = afterDate.substring(idx + ts.length);
             }
         }
 
+        const amounts = [];
+        // OCR 친화적 숫자 매칭: 콤마/마침표를 천 단위 구분자로 모두 인정
+        // 예: "29,536,750" ✓  "29.536.750" ✓ (OCR이 콤마를 점으로 읽음)  "29700,000" ✓ (콤마 위치 어긋남)
+        const numRegex = /\d[\d,.]*\d|\d/g;
+        let m;
+        while ((m = numRegex.exec(afterDate)) !== null) {
+            const raw = m[0];
+            const digits = raw.replace(/[.,]/g, '');
+            const hasSep = /[,.]/.test(raw);
+            // 구분자 있으면 4~12자리, 없으면 4~9자리 (10+자리 미구분자는 계좌번호/관리번호)
+            if (digits.length < 4) continue;
+            if (hasSep) {
+                if (digits.length > 12) continue;
+            } else {
+                if (digits.length > 9) continue;
+                // 0으로 시작하는 미구분자 4자리 이상은 계좌/관리번호 가능성 → 스킵
+                if (digits.startsWith('0')) continue;
+            }
+            const num = parseInt(digits, 10);
+            if (isNaN(num) || num <= 0) continue;
+            amounts.push(num);
+        }
+
         // 적요 추출
-        const descParts = afterDate.replace(/[\d,]+/g, '|').split('|').map(s => s.trim()).filter(s => s && s.length > 1 && !/^\d+$/.test(s));
+        const descParts = afterDate.replace(/[\d,.]+/g, '|').split('|').map(s => s.trim()).filter(s => s && s.length > 1 && !/^\d+$/.test(s));
         const description = descParts.join(' ').substring(0, 60) || '';
 
         if (amounts.length > 0) {
@@ -1275,7 +1430,22 @@ function parseBankPDF(text) {
     const useBalanceChain = bestScore >= Math.max(1, (rawEntries.length - 1) * 0.3);
 
     // 3단계: 잔액 체인 기반으로 거래 금액 역산
+    // 검증: 잔액 차이가 실제 줄에 적힌 금액과 일치하는지 확인 (OCR이 한 줄을 놓치면
+    // diff가 두 거래의 합으로 부풀려져 33,000,000 같은 가짜 금액이 만들어짐)
     const rows = [];
+    const MAX_PLAUSIBLE_AMOUNT = 1e12; // 1조 이상의 단일 거래는 OCR 오류로 간주
+
+    function findLineAmountMatch(entry, targetAmt, balance) {
+        // 줄에서 추출된 amounts 중 targetAmt과 ±1 이내로 일치하는 값 찾기
+        const others = entry.amounts.filter(a => a !== balance);
+        if (others.length === 0) return null;
+        const exact = others.find(a => Math.abs(a - targetAmt) <= 1);
+        if (exact) return exact;
+        // 비례 오차 1% 이내도 허용 (큰 금액의 OCR 오차)
+        const close = others.find(a => Math.abs(a - targetAmt) / Math.max(targetAmt, 1) < 0.01);
+        return close || null;
+    }
+
     if (useBalanceChain && rawEntries.length >= 2) {
         for (let i = 0; i < rawEntries.length; i++) {
             const entry = rawEntries[i];
@@ -1288,14 +1458,25 @@ function parseBankPDF(text) {
                     const nextBal = getBalance(rawEntries[i + 1]);
                     if (nextBal != null) {
                         const diff = balance - nextBal;
-                        // 첫 행의 거래금액은 amounts에서 balance를 제외한 것 중 diff와 가까운 값
+                        const absDiff = Math.abs(diff);
+                        if (absDiff > MAX_PLAUSIBLE_AMOUNT) continue;
                         const others = entry.amounts.filter(a => a !== balance);
-                        const closestAmt = others.find(a => Math.abs(a - Math.abs(diff)) <= 1);
+                        const closestAmt = others.find(a => Math.abs(a - absDiff) <= 1);
+                        // 방향 추론: diff > 0 (다음 잔액 더 작음) = 첫 줄에서 잔액이 더 컸음 = 첫 줄은 입금
+                        // 즉 diff > 0 → 첫 줄은 입금 (deposit), diff < 0 → 첫 줄은 출금 (withdrawal)
+                        // (NOT confused with later rows where diff = prevBalance - currBalance)
+                        const firstIsDeposit = diff > 0;
                         if (closestAmt) {
-                            if (diff > 0) rows.push([entry.dateStr, 0, closestAmt, balance, entry.description]);
-                            else rows.push([entry.dateStr, closestAmt, 0, balance, entry.description]);
+                            if (firstIsDeposit) rows.push([entry.dateStr, closestAmt, 0, balance, entry.description]);
+                            else rows.push([entry.dateStr, 0, closestAmt, balance, entry.description]);
                         } else if (others.length > 0) {
-                            rows.push([entry.dateStr, 0, others[0], balance, entry.description]);
+                            // 줄 텍스트 단서로 보강
+                            const lineHint = entry.line || '';
+                            const txtSaysDeposit = /입금|수입|수금|회수|입출금?\s*[\+]/.test(lineHint);
+                            const txtSaysWithdrawal = /출금|지출|이체|결제|지급|상환|납부/.test(lineHint);
+                            const isDep = txtSaysDeposit ? true : (txtSaysWithdrawal ? false : firstIsDeposit);
+                            if (isDep) rows.push([entry.dateStr, others[0], 0, balance, entry.description]);
+                            else rows.push([entry.dateStr, 0, others[0], balance, entry.description]);
                         }
                     }
                 }
@@ -1305,13 +1486,32 @@ function parseBankPDF(text) {
             const prevBalance = getBalance(rawEntries[i - 1]);
             if (prevBalance == null) continue;
             const diff = prevBalance - balance;
+            const absDiff = Math.abs(diff);
 
-            let deposit = 0, withdrawal = 0;
-            if (diff > 0) withdrawal = diff;
-            else if (diff < 0) deposit = Math.abs(diff);
-            else continue;
+            if (diff === 0) continue;
+            // 비현실적으로 큰 잔액 차이는 OCR 오류 (예: 100,067,920 같은 환각 금액)
+            if (absDiff > MAX_PLAUSIBLE_AMOUNT) continue;
 
-            rows.push([entry.dateStr, deposit, withdrawal, balance, entry.description]);
+            // 검증: implied amount가 줄에 실제 적힌 금액과 일치하는가?
+            const matched = findLineAmountMatch(entry, absDiff, balance);
+            let txAmt = absDiff;
+            if (!matched) {
+                const others = entry.amounts.filter(a => a !== balance);
+                // diff가 1,000원 이상이고 합리적이면 → 잔액 체인을 신뢰
+                // (줄 후보가 OCR 오류로 잘려 시간/번호 같은 작은 숫자만 남았을 가능성이 높음)
+                // 잔액 체인은 두 줄의 잔액을 동시에 잘못 읽지 않는 한 정확함
+                if (absDiff >= 1000 && absDiff < MAX_PLAUSIBLE_AMOUNT) {
+                    txAmt = absDiff;
+                } else if (others.length === 1) {
+                    // 잔액 체인이 신뢰할 수 없는 경우만 줄 후보 사용
+                    txAmt = others[0];
+                } else {
+                    continue;
+                }
+            }
+
+            const isWithdrawal = diff > 0;
+            rows.push([entry.dateStr, isWithdrawal ? 0 : txAmt, isWithdrawal ? txAmt : 0, balance, entry.description]);
         }
     } else {
         // 잔액 체인 불가 → 금액이 1~2개인 경우 처리
@@ -1369,22 +1569,85 @@ function parseFundReport(text) {
     }
 
     // === 일일 자금 계획/자금일보 형식 감지 ===
+    // OCR이 표 헤더("수입/지출/조달")를 놓쳐도 항목명 키워드로 자금일보임을 인식
     const fullText = text.replace(/\s+/g, ' ');
-    const isDailyFundPlan = /자금\s*계획|자금\s*일보|현금\s*시재|전일\s*이월|조달\s*후/i.test(fullText);
+    const formatHints = /자금\s*계획|자금\s*일보|현금\s*시재|전일\s*이월|조달\s*후|일일\s*자금|자금\s*현황|계획일자|결재.*담당.*실장|구\s*분.*과\s*목/i;
+    const itemHints = /외상대\s*수금|외상대\s*결제|차입금\s*상환|일반\s*경비|전도금|설비\s*투자|연구\s*개발|정부\s*지원|예금\s*입출|급\s*\/?\s*상여|회직\s*급여|매출\s*수금/i;
+    const isDailyFundPlan = formatHints.test(fullText) || itemHints.test(fullText);
 
-    if (isDailyFundPlan) {
+    // 표 형식(계좌별 가로 나열) 강한 신호: 보통예금/정기예금 등 계정 키워드가 있는 경우만
+    const hasAccountKeyword = /(보통|정기)\s*예금|MMF|CMA|당좌\s*예금|외화\s*예금|수시\s*입출금|기업\s*자유\s*예금|별단\s*예금/.test(fullText);
+
+    if (isDailyFundPlan || !hasAccountKeyword) {
+        // OCR 망가진 자금일보거나, 표 형식 단서가 없으면 자금일보 파서 사용
+        // 자금일보 파서는 항목명 미인식 시 빈 결과를 반환 (가짜 거래 생성 안 함)
         return parseDailyFundPlan(text, result);
     }
 
-    // === 기존 표 형식 (계좌별 가로 나열) ===
+    // === 표 형식 (계좌별 가로 나열) — 계정 키워드가 있을 때만 실행 ===
     return parseFundReportTable(text, result);
 }
 
 function parseDailyFundPlan(text, result) {
     const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-    const numPattern = /[\d,]+/g;
 
-    let section = 'none'; // 'income', 'expense', 'funding', 'none'
+    // 한국 화폐 형식 검증: 콤마가 있으면 3자리 그룹, 없으면 4~12자리 정수
+    function extractValidAmounts(line) {
+        const out = [];
+        const re = /[\d,]+/g;
+        let m;
+        while ((m = re.exec(line)) !== null) {
+            const raw = m[0];
+            if (raw === ',' || raw.replace(/,/g, '') === '') continue;
+            const digits = raw.replace(/,/g, '');
+            if (raw.includes(',')) {
+                if (!/^\d{1,3}(,\d{3})+$/.test(raw)) continue;
+            } else {
+                if (digits.length < 4 || digits.length > 12) continue;
+            }
+            const num = parseInt(digits, 10);
+            if (isNaN(num) || num < 1000) continue;
+            out.push(num);
+        }
+        return out;
+    }
+
+    // 항목명 기반 분류 — OCR이 섹션 헤더(수입/지출/조달, 세로쓰기)를 놓쳤을 때
+    // 항목 이름만으로도 정확히 분류하기 위함
+    function classifyFundItem(line) {
+        const t = line.replace(/\s+/g, '');
+
+        // 줄이 "조달" / "수입" / "지출"로 시작하면 (구분 컬럼) 가장 강한 신호
+        if (/^조[달찰]/.test(t)) return 'funding';
+        if (/^수입/.test(t)) return 'income';
+        if (/^지출/.test(t)) return 'expense';
+
+        // 조달 (funding) — 차입금상환과 충돌하지 않도록 먼저
+        if (/예금입출/.test(t)) return 'funding';
+        // 정부지원자금 (OCR이 "정"을 "성"으로 읽는 흔한 오인식 허용)
+        if (/[정성]부지원자금|[정성]부지원금|지원자금|보조금/.test(t)) return 'funding';
+        if (/조달자금|조달후/.test(t)) return 'funding';
+        // 차입금 단독 (상환 없음) → 조달
+        if (/차입금/.test(t) && !/차입금상환|상환/.test(t)) return 'funding';
+
+        // 지출 (expense)
+        if (/차입금상환/.test(t)) return 'expense';
+        if (/외상대결제/.test(t)) return 'expense';
+        if (/설비투자/.test(t)) return 'expense';
+        if (/연구개발/.test(t)) return 'expense';
+        if (/급\/?상여|회직급여|급상여/.test(t)) return 'expense';
+        if (/일반경비/.test(t)) return 'expense';
+        if (/전도금/.test(t)) return 'expense';
+        if (/지급|결제|상환|납부|이체출금|출금|급여|경비|투자|개발비/.test(t)) return 'expense';
+
+        // 수입 (income) — 외상대 수금 우선
+        if (/외상대수금|매출수금/.test(t)) return 'income';
+        if (/수금|회수|이체입금|매출입금|매출대금|입금/.test(t)) return 'income';
+
+        return null;
+    }
+
+    let section = 'none';
     let openingBalance = 0;
     let closingBalance = 0;
 
@@ -1396,12 +1659,22 @@ function parseDailyFundPlan(text, result) {
         const line = lines[i];
         const cleanLine = line.replace(/\s+/g, '');
 
-        // 기초 잔액 (전일이월, 현금시재, 전일잔액)
-        if (/전일이월|전일\s*잔액|현금\s*시재|기초\s*시재/.test(line) && !/조달/.test(line)) {
-            const nums = line.match(numPattern);
-            if (nums) {
-                const candidates = nums.map(n => parseFloat(n.replace(/,/g, ''))).filter(n => n >= 1000);
-                if (candidates.length > 0) {
+        // 기초/마감 잔액 — 같은 줄에 둘 다 있을 수 있음(PDF 한 행에 박스 2개)
+        const hasOpening = /전일이월|전일\s*잔액|기초\s*시재/.test(line);
+        const hasClosing = /조달\s*후|마감\s*시재|당일\s*잔액|기말\s*시재|마감\s*잔액/.test(line);
+        if (hasOpening || hasClosing) {
+            const candidates = extractValidAmounts(line);
+            if (candidates.length > 0) {
+                if (hasOpening && hasClosing && candidates.length >= 2) {
+                    // 같은 줄에 둘 다 — 첫 번째는 기초, 마지막은 마감
+                    openingBalance = candidates[0];
+                    closingBalance = candidates[candidates.length - 1];
+                    result.openingBalance = openingBalance;
+                    result.closingBalance = closingBalance;
+                } else if (hasClosing) {
+                    closingBalance = Math.max(...candidates);
+                    result.closingBalance = closingBalance;
+                } else {
                     openingBalance = Math.max(...candidates);
                     result.openingBalance = openingBalance;
                 }
@@ -1409,76 +1682,63 @@ function parseDailyFundPlan(text, result) {
             continue;
         }
 
-        // 마감 잔액 (조달 후 현금시재, 당일잔액, 마감시재)
-        if (/조달\s*후|마감\s*시재|당일\s*잔액|기말\s*시재|마감\s*잔액/.test(line)) {
-            const nums = line.match(numPattern);
-            if (nums) {
-                const candidates = nums.map(n => parseFloat(n.replace(/,/g, ''))).filter(n => n >= 1000);
-                if (candidates.length > 0) {
-                    closingBalance = Math.max(...candidates);
-                    result.closingBalance = closingBalance;
-                }
-            }
-            continue;
-        }
-
-        // 과부족 줄 - 스킵
+        // 과부족 줄 — 스킵 (잔액 차이 표시이므로 거래 아님)
         if (/과\s*부\s*족/.test(line)) continue;
 
-        // 섹션 감지
-        if (/^수\s*입$|수입\s*항목|입금\s*내역/.test(cleanLine) || /구\s*분.*수\s*입/.test(line)) {
+        // 메타/주석/노트 줄 스킵 — 거래가 아니므로 가짜 거래 생성 방지
+        if (/^\s*[※*]/.test(line)) continue;
+        if (/회\s*사\s*명|예\s*금\s*주|계\s*좌\s*번\s*호|조\s*회\s*기\s*간|계\s*획\s*일\s*자|단\s*위\s*[:：]|문\s*서\s*번\s*호|법\s*인\s*명|작\s*성\s*자|결\s*재/.test(line)) continue;
+
+        // 명시적 섹션 헤더 (있는 경우만)
+        if (/^[\|\s]*수\s*입[\|\s]*$|수입\s*항목|입금\s*내역/.test(cleanLine)) {
             section = 'income'; continue;
         }
-        if (/^지\s*출$|지출\s*항목|출금\s*내역/.test(cleanLine) || /구\s*분.*지\s*출/.test(line)) {
+        if (/^[\|\s]*지\s*출[\|\s]*$|지출\s*항목|출금\s*내역/.test(cleanLine)) {
             section = 'expense'; continue;
         }
-        if (/^조\s*달$|조달\s*항목|조달\s*내역/.test(cleanLine)) {
+        if (/^[\|\s]*조\s*달[\|\s]*$|조달\s*항목|조달\s*내역/.test(cleanLine)) {
             section = 'funding'; continue;
         }
 
-        // 소계 줄 - 섹션 종료 신호
-        if (/소\s*계/.test(line)) {
-            if (section === 'income') section = 'expense';
-            else if (section === 'expense') section = 'funding';
-            continue;
-        }
+        // 소계/합계/총계 줄 — 스킵 (섹션 전환은 항목명 분류로 처리)
+        if (/소\s*계|^\s*합\s*계\s*$|^\s*총\s*계\s*$/.test(line)) continue;
 
         // 헤더/라벨 줄 스킵
-        if (/구\s*분|과\s*목|금\s*액|세\s*부\s*내\s*역|항\s*목/.test(line) && !/[\d,]{4,}/.test(line)) continue;
-
-        // 금액 추출
-        const nums = line.match(numPattern);
-        if (!nums) continue;
-        const amounts = nums.map(n => parseFloat(n.replace(/,/g, ''))).filter(n => n >= 100);
-        if (amounts.length === 0) continue;
+        if (/구\s*분|과\s*목|^\s*금\s*액\s*$|세\s*부\s*내\s*역|^\s*항\s*목\s*$/.test(line) && !/[\d,]{4,}/.test(line)) continue;
 
         // 날짜만 있는 줄 스킵 (24/11/11 같은)
         if (/^\d{2,4}[\/.\-]\d{1,2}[\/.\-]\d{1,2}$/.test(line.replace(/\s/g, ''))) continue;
 
-        // 항목명 추출 (숫자와 특수문자 제거)
-        let itemName = line.replace(/[\d,]+/g, '').replace(/[|│┃]/g, '').trim();
-        itemName = itemName.replace(/^\s*[○●■□▪▸►·\-]\s*/, '').trim();
-        if (!itemName || itemName.length > 40) itemName = '미분류';
+        // 엄격한 금액 추출 (한국 화폐 형식, >= 1,000)
+        const validNums = extractValidAmounts(line);
+        if (validNums.length === 0) continue;
 
-        const amount = amounts[0];
+        // 항목명 추출 (숫자, 특수문자, 괄호 정리)
+        let itemName = line.replace(/[\d,]+/g, '').replace(/[|│┃()（）]/g, ' ').trim();
+        itemName = itemName.replace(/^\s*[○●■□▪▸►·\-]\s*/, '').replace(/\s+/g, ' ').trim();
+
+        // OCR 노이즈 제거: 한글이 거의 없거나 이상 문자가 많은 줄 스킵
+        const koreanChars = (itemName.match(/[가-힣]/g) || []).length;
+        if (koreanChars < 2) continue;
+        if (!itemName || itemName.length > 60) continue;
+
+        // 가장 큰 금액을 거래 금액으로 (보통 행의 주 금액)
+        const amount = Math.max(...validNums);
         if (amount === 0) continue;
 
-        // 섹션 자동 감지 (명시적 섹션 헤더가 없을 때)
-        if (section === 'none') {
-            if (/수금|입금|매출|수입|회수|이체입|송금받/.test(line)) section = 'income';
-            else if (/지급|출금|지출|결제|이체출|송금|경비|급여|상환|납부/.test(line)) section = 'expense';
-            else if (/차입|조달|대출/.test(line)) section = 'funding';
-        }
+        // 항목명 기반 분류 (가장 신뢰도 높음)
+        const itemClass = classifyFundItem(line);
+        // 명시적 분류가 있으면 그것을 사용, 없으면 섹션 상태, 마지막 fallback은 expense
+        const finalSection = itemClass || (section !== 'none' ? section : 'expense');
+
+        // 분류 신호로 섹션 상태 업데이트 (다음 항목들의 fallback에 사용)
+        if (itemClass) section = itemClass;
 
         const item = { name: itemName, amount, description: line.substring(0, 80) };
 
-        if (section === 'income') {
-            incomeItems.push(item);
-        } else if (section === 'expense' || section === 'none') {
-            expenseItems.push(item);
-        } else if (section === 'funding') {
-            fundingItems.push(item);
-        }
+        if (finalSection === 'income') incomeItems.push(item);
+        else if (finalSection === 'funding') fundingItems.push(item);
+        else expenseItems.push(item);
     }
 
     // transactions로 변환
@@ -1548,7 +1808,9 @@ function parseFundReportTable(text, result) {
         let bankName = '';
         for (const bn of bankNames) { if (trimmed.includes(bn)) { bankName = bn; break; } }
 
-        if (acctName || numbers.length >= 3) {
+        // 안전장치: 계정 키워드가 없으면 위치 기반 추측을 하지 않음
+        // (OCR 노이즈 줄에서 가짜 거래 생성 방지)
+        if (acctName) {
             const nums = numbers.map(n => parseFloat(n.replace(/,/g, '')));
             if (nums.length >= 4) {
                 result.transactions.push({

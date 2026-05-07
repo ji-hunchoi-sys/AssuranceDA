@@ -821,7 +821,7 @@
       const primaryKeyword = buildDartKeyword(ctx.keyword, multiKw);
 
       scanState = {
-        active: true,
+        active: true,                       // scanLoop가 DART 페이지를 fetch 중
         done: false,
         cancelled: false,
         records: [],
@@ -837,9 +837,14 @@
         multiKw,
         primaryKeyword,
         auditOnly: isAuditContentOnly(),    // 감사보고서 본문 한정 모드
-        auditVerified: {},                  // rcept_no → {matched, in_audit, in_consolidated, has_audit_section, has_consolidated_section}
-        auditCheckedRcepts: new Set(),      // 이미 검증 요청한 rcept_no
-        droppedByAuditCheck: 0,             // 검증 실패로 제외된 건수
+        auditVerified: {},                  // rcept_no → {matched, in_audit, in_consolidated, ...}
+        auditCheckedRcepts: new Set(),      // verify 큐에 이미 enqueue한 rcept_no
+        droppedByAuditCheck: 0,
+        // ── 백그라운드 워커 ──
+        verifyQueue: [],                    // verify 대기 rcept_no
+        extractQueue: [],                   // extract 대기 rcept_no
+        verifyWorkerRunning: false,
+        extractWorkerRunning: false,
       };
 
       // 이미 로드된 첫 페이지 결과를 시드로 활용
@@ -861,99 +866,166 @@
       });
     }
 
-    // 감사본문 검증을 배치로 실행하고, 실패한 rcept_no는 1건씩 재시도해서 silent drop을 방지
-    async function _verifyBatchWithRetry(rceptNos, keywords, abortSignal) {
-      const all = await verifyAuditContent(rceptNos, keywords, abortSignal);
-      // 결과에 빠진 rcept_no가 있으면 1건씩 재시도
-      const missing = rceptNos.filter(r => !(r in all));
-      for (const rcept of missing) {
-        if (abortSignal && abortSignal.aborted) break;
-        try {
-          const single = await verifyAuditContent([rcept], keywords, abortSignal);
-          if (single[rcept]) all[rcept] = single[rcept];
-          else all[rcept] = { matched: false, in_audit: false, in_consolidated: false, has_audit_section: false, has_consolidated_section: false, error: true };
-        } catch (err) {
-          if (err.name === 'AbortError') break;
-          all[rcept] = { matched: false, in_audit: false, in_consolidated: false, has_audit_section: false, has_consolidated_section: false, error: true };
-        }
-      }
-      return all;
+    // ══════════════════════════════════════════════════
+    // ── 백그라운드 워커: verify / extract ──
+    // scanLoop와 독립적으로 큐를 처리. UI는 scan + workers 모두 종료될 때 "완료" 상태가 됨.
+    // ══════════════════════════════════════════════════
+
+    function getVerifyKeywords() {
+      const andTerms = (scanState.multiKw || []).filter(k => k.op === 'AND').map(k => k.term);
+      return andTerms.length > 0 ? andTerms : [scanState.primaryKeyword];
     }
 
-    // verify 단계: 신규 추가된 record들에 대해 (연결)감사보고서 본문 검증
-    async function _runAuditVerifyForBatch(newlyAdded) {
-      if (!scanState || !scanState.auditOnly || newlyAdded.length === 0) return;
+    async function _checkAuditContentBatch(rceptNos, keywords, signal) {
+      const resp = await fetchWithTimeout(`${API_BASE}/check-audit-content`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rcept_nos: rceptNos, keywords }),
+        signal,
+      }, 90000);
+      const data = await resp.json();
+      return (data && data.results) ? data.results : {};
+    }
+
+    async function runVerifyWorker() {
+      if (!scanState || scanState.verifyWorkerRunning) return;
+      scanState.verifyWorkerRunning = true;
+      try {
+        while (scanState && !scanState.cancelled) {
+          if (scanState.verifyQueue.length === 0) {
+            // scanLoop도 끝났고 큐도 비었으면 종료
+            if (!scanState.active) break;
+            await new Promise(r => setTimeout(r, 250));
+            continue;
+          }
+
+          const batch = scanState.verifyQueue.splice(0, 8);
+          const keywords = getVerifyKeywords();
+
+          let results = {};
+          try {
+            results = await _checkAuditContentBatch(batch, keywords, scanState.controller.signal);
+          } catch (err) {
+            if (err.name === 'AbortError') break;
+            console.warn('verify worker batch 실패, 1건씩 재시도', err);
+          }
+
+          // 응답에 빠진 rcept_no는 1건씩 재시도 → 그래도 실패하면 error 표기
+          for (const rcept of batch) {
+            if (results[rcept]) {
+              scanState.auditVerified[rcept] = results[rcept];
+              continue;
+            }
+            if (scanState.cancelled) break;
+            try {
+              const single = await _checkAuditContentBatch([rcept], keywords, scanState.controller.signal);
+              scanState.auditVerified[rcept] = single[rcept] || {
+                matched: false, in_audit: false, in_consolidated: false,
+                has_audit_section: false, has_consolidated_section: false, error: true,
+              };
+            } catch (err) {
+              if (err.name === 'AbortError') break;
+              scanState.auditVerified[rcept] = {
+                matched: false, in_audit: false, in_consolidated: false,
+                has_audit_section: false, has_consolidated_section: false, error: true,
+              };
+            }
+          }
+
+          scanState.droppedByAuditCheck = scanState.records.filter(r => {
+            const v = scanState.auditVerified[r.rcept_no];
+            return v && !v.matched;
+          }).length;
+
+          if (pageResultsBackup !== null) rerenderScanResults();
+          updateScanBanner();
+        }
+      } finally {
+        if (scanState) {
+          scanState.verifyWorkerRunning = false;
+          updateScanBanner();
+        }
+      }
+    }
+
+    async function runExtractWorker() {
+      if (!scanState || scanState.extractWorkerRunning) return;
+      scanState.extractWorkerRunning = true;
+      try {
+        while (scanState && !scanState.cancelled) {
+          if (scanState.extractQueue.length === 0) {
+            if (!scanState.active) break;
+            await new Promise(r => setTimeout(r, 250));
+            continue;
+          }
+
+          const batch = scanState.extractQueue.splice(0, SCAN_AUDITOR_BATCH);
+          try {
+            const resp = await fetchWithTimeout(`${API_BASE}/extract-auditors`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ rcept_nos: batch }),
+              signal: scanState.controller.signal,
+            }, 90000);
+            const ed = await resp.json();
+            if (ed && ed.auditors) {
+              Object.entries(ed.auditors).forEach(([rcept, auditor]) => {
+                scanState.auditors[rcept] = auditor || '';
+                if (auditor) allAuditors[rcept] = auditor;
+              });
+            }
+          } catch (err) {
+            if (err.name === 'AbortError') break;
+            console.warn('extract worker batch 실패', err);
+          }
+
+          if (pageResultsBackup !== null) rerenderScanResults();
+          updateScanBanner();
+        }
+      } finally {
+        if (scanState) {
+          scanState.extractWorkerRunning = false;
+          updateScanBanner();
+        }
+      }
+    }
+
+    function _enqueueWorkForBatch(newlyAdded) {
+      if (!scanState) return;
 
       // 외부감사 타입은 자체가 감사보고서이므로 검증 면제
-      newlyAdded.filter(r => isFilingAlreadyAudit(r)).forEach(r => {
-        scanState.auditVerified[r.rcept_no] = {
-          matched: true, in_audit: true, in_consolidated: false,
-          has_audit_section: true, has_consolidated_section: false,
-          exempt: true,
-        };
-      });
+      if (scanState.auditOnly) {
+        newlyAdded.filter(r => isFilingAlreadyAudit(r)).forEach(r => {
+          scanState.auditVerified[r.rcept_no] = {
+            matched: true, in_audit: true, in_consolidated: false,
+            has_audit_section: true, has_consolidated_section: false,
+            exempt: true,
+          };
+        });
 
-      const toVerify = newlyAdded
-        .filter(r => !isFilingAlreadyAudit(r) && !scanState.auditCheckedRcepts.has(r.rcept_no))
-        .map(r => r.rcept_no);
-      if (toVerify.length === 0) return;
-
-      toVerify.forEach(r => scanState.auditCheckedRcepts.add(r));
-
-      const verifyKeywords = (scanState.multiKw && scanState.multiKw.length > 0)
-        ? scanState.multiKw.filter(k => k.op === 'AND').map(k => k.term)
-        : [scanState.primaryKeyword];
-
-      try {
-        const verifyResults = await _verifyBatchWithRetry(toVerify, verifyKeywords, scanState.controller.signal);
-        for (const [rcept, info] of Object.entries(verifyResults)) {
-          scanState.auditVerified[rcept] = info;
+        const toVerify = newlyAdded
+          .filter(r => !isFilingAlreadyAudit(r) && !scanState.auditCheckedRcepts.has(r.rcept_no))
+          .map(r => r.rcept_no);
+        toVerify.forEach(r => scanState.auditCheckedRcepts.add(r));
+        if (toVerify.length > 0) {
+          scanState.verifyQueue.push(...toVerify);
+          if (!scanState.verifyWorkerRunning) {
+            runVerifyWorker().catch(err => console.warn('verify worker error', err));
+          }
         }
-        scanState.droppedByAuditCheck = scanState.records.filter(r => {
-          const v = scanState.auditVerified[r.rcept_no];
-          return v && !v.matched;
-        }).length;
-      } catch (err) {
-        if (err.name !== 'AbortError') console.warn('감사본문 검증 단계 오류:', err);
       }
-      if (pageResultsBackup !== null) rerenderScanResults();
-      updateScanBanner();
-    }
 
-    // extract 단계: 정기공시 record들에 대해 감사인 추출
-    async function _runAuditorExtractForBatch(newlyAdded) {
-      if (!scanState) return;
       const needExtract = newlyAdded
         .filter(r => r.rcept_no
           && (r.filing_type || '').includes('정기공시')
           && !scanState.auditors[r.rcept_no]
           && !scanState.extractedRcepts.has(r.rcept_no))
         .map(r => r.rcept_no);
-      if (needExtract.length === 0) return;
-
-      for (let i = 0; i < needExtract.length; i += SCAN_AUDITOR_BATCH) {
-        if (!scanState || scanState.cancelled) break;
-        const batch = needExtract.slice(i, i + SCAN_AUDITOR_BATCH);
-        batch.forEach(rcept => scanState.extractedRcepts.add(rcept));
-        try {
-          const resp = await fetchWithTimeout(`${API_BASE}/extract-auditors`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ rcept_nos: batch }),
-            signal: scanState.controller.signal,
-          }, 90000);
-          const ed = await resp.json();
-          if (ed && ed.auditors) {
-            Object.entries(ed.auditors).forEach(([rcept, auditor]) => {
-              scanState.auditors[rcept] = auditor || '';
-              if (auditor) allAuditors[rcept] = auditor;
-            });
-            if (pageResultsBackup !== null) rerenderScanResults();
-            updateScanBanner();
-          }
-        } catch (err) {
-          if (err.name === 'AbortError' || (scanState && scanState.cancelled)) break;
-          console.warn('스캔 감사인 추출 실패', err);
+      needExtract.forEach(r => scanState.extractedRcepts.add(r));
+      if (needExtract.length > 0) {
+        scanState.extractQueue.push(...needExtract);
+        if (!scanState.extractWorkerRunning) {
+          runExtractWorker().catch(err => console.warn('extract worker error', err));
         }
       }
     }
@@ -961,93 +1033,92 @@
     async function scanLoop() {
       if (!scanState) return;
 
-      let consecutiveNoNew = 0;          // 연속 0 신규 페이지 카운트
-      const NO_NEW_TOLERANCE = 2;        // 2회 연속 0건이면 universe 소진으로 판단해 종료
+      let consecutiveNoNew = 0;
+      const NO_NEW_TOLERANCE = 2;
 
-      while (scanState && scanState.active && !scanState.cancelled && scanState.pagesScanned < scanState.pageLimit) {
-        const page = scanState.pagesScanned + 1;
-        const params = new URLSearchParams({
-          keyword: scanState.primaryKeyword,
-          start_date: scanState.ctx.start_date,
-          end_date: scanState.ctx.end_date,
-          page: String(page),
-          max_results: String(SCAN_API_PAGE_SIZE),
-          dsp_type: scanState.ctx.dsp_types.join(','),
-          corp_name: scanState.ctx.corp_name,
-          scan: 'true',
-        });
+      try {
+        while (scanState && scanState.active && !scanState.cancelled && scanState.pagesScanned < scanState.pageLimit) {
+          const page = scanState.pagesScanned + 1;
+          const params = new URLSearchParams({
+            keyword: scanState.primaryKeyword,
+            start_date: scanState.ctx.start_date,
+            end_date: scanState.ctx.end_date,
+            page: String(page),
+            max_results: String(SCAN_API_PAGE_SIZE),
+            dsp_type: scanState.ctx.dsp_types.join(','),
+            corp_name: scanState.ctx.corp_name,
+            scan: 'true',
+          });
 
-        let data;
-        try {
-          const resp = await fetchWithTimeout(
-            `${API_BASE}/search?${params}`,
-            { signal: scanState.controller.signal },
-            FETCH_TIMEOUT
-          );
-          data = await resp.json();
-          if (!resp.ok) throw new Error(data.error || '스캔 요청 실패');
-        } catch (err) {
-          if (err.name === 'AbortError' || (scanState && scanState.cancelled)) break;
-          console.warn('스캔 페이지 실패', page, err);
-          break;
-        }
-
-        if (data.total && !scanState.totalUniverse) {
-          scanState.totalUniverse = data.total;
-        }
-
-        let newRecords = data.results || [];
-        const clientKw = getClientSideMultiKw(scanState.multiKw);
-        if (clientKw) {
-          newRecords = filterResultsByMultiKeyword(newRecords, clientKw);
-        }
-
-        const newlyAdded = [];
-        for (const r of newRecords) {
-          if (r.rcept_no && !scanState.seenRcept.has(r.rcept_no)) {
-            scanState.records.push(r);
-            scanState.seenRcept.add(r.rcept_no);
-            if (r.auditor) scanState.auditors[r.rcept_no] = r.auditor;
-            newlyAdded.push(r);
-          }
-        }
-
-        scanState.pagesScanned = page;
-        scanState.hasMoreOnDart = !!data.has_next;
-        updateScanBanner();
-        if (pageResultsBackup !== null) rerenderScanResults();
-
-        // ── 후처리: verify + extract를 병렬 실행 ──
-        await Promise.all([
-          _runAuditVerifyForBatch(newlyAdded),
-          _runAuditorExtractForBatch(newlyAdded),
-        ]);
-
-        // ── 종료 조건 ──
-        // 1) DART에 더 없다고 명시적으로 알려준 경우
-        if (!data.has_next) {
-          scanState.done = true;
-          break;
-        }
-        // 2) 신규 0건 페이지가 NO_NEW_TOLERANCE회 연속 → universe 소진 (DART metadata 오류 방어)
-        if (newlyAdded.length === 0) {
-          consecutiveNoNew++;
-          if (consecutiveNoNew >= NO_NEW_TOLERANCE) {
-            console.info(`스캔 종료: ${NO_NEW_TOLERANCE}회 연속 신규 0건 (universe 소진)`);
-            scanState.done = true;
-            scanState.hasMoreOnDart = false;
+          let data;
+          try {
+            const resp = await fetchWithTimeout(
+              `${API_BASE}/search?${params}`,
+              { signal: scanState.controller.signal },
+              FETCH_TIMEOUT
+            );
+            data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || '스캔 요청 실패');
+          } catch (err) {
+            if (err.name === 'AbortError' || (scanState && scanState.cancelled)) break;
+            console.warn('스캔 페이지 실패', page, err);
             break;
           }
-        } else {
-          consecutiveNoNew = 0;
-        }
-      }
 
-      if (scanState) {
-        scanState.active = false;
-        if (!scanState.cancelled) scanState.done = true;
+          if (data.total && !scanState.totalUniverse) {
+            scanState.totalUniverse = data.total;
+          }
+
+          let newRecords = data.results || [];
+          const clientKw = getClientSideMultiKw(scanState.multiKw);
+          if (clientKw) {
+            newRecords = filterResultsByMultiKeyword(newRecords, clientKw);
+          }
+
+          const newlyAdded = [];
+          for (const r of newRecords) {
+            if (r.rcept_no && !scanState.seenRcept.has(r.rcept_no)) {
+              scanState.records.push(r);
+              scanState.seenRcept.add(r.rcept_no);
+              if (r.auditor) scanState.auditors[r.rcept_no] = r.auditor;
+              newlyAdded.push(r);
+            }
+          }
+
+          scanState.pagesScanned = page;
+          scanState.hasMoreOnDart = !!data.has_next;
+
+          // 큐에 enqueue (워커가 백그라운드에서 처리)
+          _enqueueWorkForBatch(newlyAdded);
+
+          updateScanBanner();
+          if (pageResultsBackup !== null) rerenderScanResults();
+
+          // ── 종료 조건 ──
+          if (!data.has_next) {
+            scanState.done = true;
+            break;
+          }
+          if (newlyAdded.length === 0) {
+            consecutiveNoNew++;
+            if (consecutiveNoNew >= NO_NEW_TOLERANCE) {
+              console.info(`스캔 종료: ${NO_NEW_TOLERANCE}회 연속 신규 0건 (universe 소진)`);
+              scanState.done = true;
+              scanState.hasMoreOnDart = false;
+              break;
+            }
+          } else {
+            consecutiveNoNew = 0;
+          }
+        }
+      } finally {
+        if (scanState) {
+          scanState.active = false;
+          if (!scanState.cancelled) scanState.done = true;
+        }
+        updateScanBanner();
       }
-      updateScanBanner();
+      // 주: 워커는 큐를 비울 때까지 백그라운드에서 계속 돌아감
     }
 
     function extendScan() {
@@ -1189,15 +1260,21 @@
         ? Math.min(100, (scanState.records.length / scanState.totalUniverse) * 100)
         : 0;
       const coveragePctRound = Math.round(coveragePctRaw);
-      // 진행률바: 종료되면 100%, 아니면 페이지%와 추출%(고유 공시 / 모집단) 중 더 큰 값을 사용
-      // 단 active 중에는 99%로 캡해 "도달은 했는데 작업이 남았네?" 혼란을 방지
+
+      const workersBusy = scanState.verifyWorkerRunning || scanState.extractWorkerRunning ||
+                          scanState.verifyQueue.length > 0 || scanState.extractQueue.length > 0;
+
+      // 진행률바 규칙:
+      // - 모든 작업(스캔 + 워커) 끝 + universe 소진 → 100%
+      // - 그 외 진행 중 → max(페이지%, 추출%) 단 99%로 캡
       let barPct;
-      if (scanState.done && !scanState.hasMoreOnDart) {
+      const everythingIdle = !scanState.active && !workersBusy;
+      if (everythingIdle && scanState.done && !scanState.hasMoreOnDart) {
         barPct = 100;
-      } else if (scanState.active) {
-        barPct = Math.min(99, Math.max(pagesPct, coveragePctRound));
-      } else {
+      } else if (scanState.cancelled) {
         barPct = Math.max(pagesPct, coveragePctRound);
+      } else {
+        barPct = Math.min(99, Math.max(pagesPct, coveragePctRound));
       }
       progressBar.style.width = barPct + '%';
 
@@ -1212,9 +1289,6 @@
       const titleSuffix = scanState.auditOnly ? ' [감사본문 한정]' : '';
       const filterLabel = filterText || (scanState.auditOnly ? '감사본문 매칭' : '감사인 미입력');
 
-      // 일관된 progress 텍스트: "추출 N/M건 (P%) · 페이지 X/Y"
-      // - 추출 = 고유 공시 (dedup 후) / 모집단 (DART 검색 매칭)
-      // - 페이지 = 우리 스캔 사이클 진행도
       const recordsCount = scanState.records.length;
       const universe = scanState.totalUniverse || 0;
       const coveragePctText = universe > 0
@@ -1226,17 +1300,43 @@
         ? `추출 ${recordsCount.toLocaleString()}/${universe.toLocaleString()}건 (${coveragePctText}) · 페이지 ${scanState.pagesScanned}/${pageLimit}`
         : `${recordsCount.toLocaleString()}건 누적 · 페이지 ${scanState.pagesScanned}/${pageLimit}`;
 
+      // 백그라운드 워커 진행 상태
+      const workerNote = (() => {
+        const parts = [];
+        if (scanState.verifyWorkerRunning || scanState.verifyQueue.length > 0) {
+          parts.push(`📑 본문검증 대기 ${scanState.verifyQueue.length}건`);
+        }
+        if (scanState.extractWorkerRunning || scanState.extractQueue.length > 0) {
+          parts.push(`👤 감사인추출 대기 ${scanState.extractQueue.length}건`);
+        }
+        return parts.length > 0 ? ` · ${parts.join(', ')}` : '';
+      })();
+
+      const workersAlive = scanState.verifyWorkerRunning || scanState.extractWorkerRunning;
+      const workersHaveWork = scanState.verifyQueue.length > 0 || scanState.extractQueue.length > 0;
+
       if (scanState.active) {
+        // 단계 1: scanLoop가 DART 페이지 fetch 중
         spinner.classList.remove('hidden');
         cancelBtn.classList.remove('hidden');
-        statusText.textContent = `🔍 [${filterLabel}] 전체 결과 스캔 중${titleSuffix}`;
-        progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
+        statusText.textContent = `🔍 [${filterLabel}] DART 페이지 스캔 중${titleSuffix}`;
+        progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭${workerNote}`;
       } else if (scanState.cancelled) {
         spinner.classList.add('hidden');
         restartBtn.classList.remove('hidden');
         statusText.textContent = `⏸ 스캔 중단됨${titleSuffix}`;
         progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
+      } else if (workersAlive || workersHaveWork) {
+        // 단계 2: scanLoop는 끝났지만 워커가 큐 처리 중
+        spinner.classList.remove('hidden');
+        cancelBtn.classList.remove('hidden');
+        const workTypes = [];
+        if (scanState.verifyWorkerRunning || scanState.verifyQueue.length > 0) workTypes.push('본문검증');
+        if (scanState.extractWorkerRunning || scanState.extractQueue.length > 0) workTypes.push('감사인추출');
+        statusText.textContent = `⚙️ DART 스캔 완료, 백그라운드 ${workTypes.join('·')} 진행 중${titleSuffix}`;
+        progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭${workerNote}`;
       } else if (scanState.done) {
+        // 단계 3: 모두 완료
         spinner.classList.add('hidden');
         const completeIcon = scanState.hasMoreOnDart ? '📦' : '✅';
         const completeLabel = scanState.hasMoreOnDart ? '1차 스캔 완료' : '전체 스캔 완료 (DART에 더 이상 신규 결과 없음)';
