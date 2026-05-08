@@ -275,9 +275,9 @@
                     <div class="upload-box" id="bankUploadBox" role="button" tabindex="0" onclick="document.getElementById('bankFileInput').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('bankFileInput').click();}">
                         <div class="upload-icon">🏦</div>
                         <h4>은행 입출금 내역 (검증 기준)</h4>
-                        <p>여러 은행 파일을 순서대로 업로드하세요 (누적 처리)</p>
+                        <p>여러 은행 파일을 한 번에 또는 순서대로 업로드하세요 (다중 선택 / 누적 처리)</p>
                         <p style="margin-top:8px; font-size:11px; color:var(--text-light);">지원: Excel(.xlsx, .xls), CSV, PDF, 이미지(PNG, JPG)</p>
-                        <input type="file" id="bankFileInput" accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.bmp,.tiff,.tif" style="display:none">
+                        <input type="file" id="bankFileInput" multiple accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.bmp,.tiff,.tif" style="display:none">
                     </div>
                     <div id="bankFileList" class="hidden" style="margin-top:8px;"></div>
                     <div id="ocrDebugPanel" class="hidden" style="margin-top:8px; padding:10px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); max-height:200px; overflow-y:auto;">
@@ -447,8 +447,8 @@
                 <div class="upload-box" id="genBankUploadBox" role="button" tabindex="0" onclick="document.getElementById('genBankInput').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('genBankInput').click();}">
                     <div class="upload-icon">📄</div>
                     <h4>은행 거래내역 파일 업로드</h4>
-                    <p>여러 은행 파일을 순서대로 업로드하세요 (누적 처리)</p>
-                    <input type="file" id="genBankInput" accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.bmp,.tiff,.tif" style="display:none">
+                    <p>여러 은행 파일을 한 번에 또는 순서대로 업로드하세요 (다중 선택 / 누적 처리)</p>
+                    <input type="file" id="genBankInput" multiple accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.bmp,.tiff,.tif" style="display:none">
                 </div>
                 <div id="genBankFileList" class="hidden" style="margin-top:12px;"></div>
             </div>
@@ -484,6 +484,14 @@
                     <div class="form-group" id="genManualThresholdGroup" style="display:none;">
                         <label>주요 거래 기준 금액</label>
                         <input type="text" id="genManualThreshold" placeholder="예: 10,000,000">
+                    </div>
+                    <div class="form-group">
+                        <label>📋 자금일보 포맷</label>
+                        <select id="genFormat">
+                            <option value="summary">요약형 (계좌별 합계 + 주요 거래 + 거래 상세)</option>
+                            <option value="ledger">시계열 Ledger형 (시간순 한 줄 한 거래)</option>
+                            <option value="category">분류형 (수입/지출 그룹 + 계정과목별)</option>
+                        </select>
                     </div>
                 </div>
                 <div style="margin-top: 20px; text-align: center;">
@@ -703,6 +711,18 @@ const bankBox = document.getElementById('bankUploadBox');
 const fundInput = document.getElementById('fundFileInput');
 const bankInput = document.getElementById('bankFileInput');
 
+// 여러 은행 파일을 순차 업로드 (handleBankFile은 OCR/PDF 파싱 등 큰 부하가 있어
+// 동시 호출 시 로딩 UI/race 문제가 생기므로 await로 직렬화).
+async function handleBankFilesSequential(files) {
+    for (const file of files) {
+        try {
+            await handleBankFile(file);
+        } catch (err) {
+            console.error('[bank upload]', file.name, err);
+        }
+    }
+}
+
 // Drag & Drop
 [fundBox, bankBox].forEach((box, idx) => {
     box.addEventListener('dragover', e => { e.preventDefault(); box.classList.add('dragover'); });
@@ -711,13 +731,16 @@ const bankInput = document.getElementById('bankFileInput');
         e.preventDefault(); box.classList.remove('dragover');
         if (e.dataTransfer.files.length) {
             if (idx === 0) handleFundFile(e.dataTransfer.files[0]);
-            else handleBankFile(e.dataTransfer.files[0]);
+            else handleBankFilesSequential(Array.from(e.dataTransfer.files));
         }
     });
 });
 
 fundInput.addEventListener('change', e => { if (e.target.files.length) handleFundFile(e.target.files[0]); e.target.value = ''; });
-bankInput.addEventListener('change', e => { if (e.target.files.length) handleBankFile(e.target.files[0]); e.target.value = ''; });
+bankInput.addEventListener('change', e => {
+    if (e.target.files.length) handleBankFilesSequential(Array.from(e.target.files));
+    e.target.value = '';
+});
 
 // ── OpenCV.js 비동기 로드 관리 ──
 let cvReadyResolve;
@@ -2093,9 +2116,25 @@ function crossValidate(fundTx, bankTx) {
     // 은행 합계 계산
     const bankTotalDeposit = bankTx.reduce((s, t) => s + t.deposit, 0);
     const bankTotalWithdrawal = bankTx.reduce((s, t) => s + t.withdrawal, 0);
-    const bankTxWithBalance = bankTx.filter(t => t.balance != null && t.balance > 0);
-    const bankOpeningBalance = bankTxWithBalance.length > 0 ? bankTxWithBalance[0].balance - bankTxWithBalance[0].deposit + bankTxWithBalance[0].withdrawal : 0;
-    const bankClosingBalance = bankTxWithBalance.length > 0 ? bankTxWithBalance[bankTxWithBalance.length - 1].balance : 0;
+    // 다중 은행 파일이면 각 은행별 첫/마지막 잔액을 합산해서 통합 잔액 계산.
+    // 단일 통합 처리하면 첫 은행 잔액만 잡혀서 다중계좌 자금일보의 합산 시재와 안 맞음.
+    let bankOpeningBalance = 0;
+    let bankClosingBalance = 0;
+    if (APP.bankFiles && APP.bankFiles.length > 0) {
+        for (const bf of APP.bankFiles) {
+            const txs = (bf.transactions || []).filter(t => t.balance != null && t.balance > 0);
+            if (txs.length > 0) {
+                bankOpeningBalance += txs[0].balance - txs[0].deposit + txs[0].withdrawal;
+                bankClosingBalance += txs[txs.length - 1].balance;
+            }
+        }
+    } else {
+        const bankTxWithBalance = bankTx.filter(t => t.balance != null && t.balance > 0);
+        if (bankTxWithBalance.length > 0) {
+            bankOpeningBalance = bankTxWithBalance[0].balance - bankTxWithBalance[0].deposit + bankTxWithBalance[0].withdrawal;
+            bankClosingBalance = bankTxWithBalance[bankTxWithBalance.length - 1].balance;
+        }
+    }
 
     // 자금일보 합계 계산
     const fundTotalDeposit = fundTx.reduce((s, t) => s + t.deposit * unitMultiplier, 0);
@@ -2572,11 +2611,27 @@ function renderAuditPoints() {
     const auditPoints = [];
 
     // 1. 잔액 불일치 포인트
+    // 다중 은행 파일이면 각 은행의 첫/마지막 잔액을 합산해서 통합 잔액 산출.
+    // 단일 통합 처리하면 첫 은행 잔액만 잡혀서 다중계좌 자금일보의 합산 시재와 안 맞음.
     const hasTotals = APP.fundData.totals && (APP.fundData.totals.openingBalance > 0 || APP.fundData.totals.closingBalance > 0);
     if (hasTotals) {
-        const bankTxWithBalance = bankTx.filter(t => t.balance != null && t.balance > 0);
-        const bankOpening = bankTxWithBalance.length > 0 ? bankTxWithBalance[0].balance - bankTxWithBalance[0].deposit + bankTxWithBalance[0].withdrawal : 0;
-        const bankClosing = bankTxWithBalance.length > 0 ? bankTxWithBalance[bankTxWithBalance.length - 1].balance : 0;
+        let bankOpening = 0;
+        let bankClosing = 0;
+        if (APP.bankFiles && APP.bankFiles.length > 0) {
+            for (const bf of APP.bankFiles) {
+                const txs = (bf.transactions || []).filter(t => t.balance != null && t.balance > 0);
+                if (txs.length > 0) {
+                    bankOpening += txs[0].balance - txs[0].deposit + txs[0].withdrawal;
+                    bankClosing += txs[txs.length - 1].balance;
+                }
+            }
+        } else {
+            const bankTxWithBalance = bankTx.filter(t => t.balance != null && t.balance > 0);
+            if (bankTxWithBalance.length > 0) {
+                bankOpening = bankTxWithBalance[0].balance - bankTxWithBalance[0].deposit + bankTxWithBalance[0].withdrawal;
+                bankClosing = bankTxWithBalance[bankTxWithBalance.length - 1].balance;
+            }
+        }
 
         if (bankOpening > 0 && Math.abs(APP.fundData.totals.openingBalance - bankOpening) > tolerance) {
             auditPoints.push({ severity: 'high', category: '잔액', message: `기초시재 불일치: 자금일보 ${formatNum(APP.fundData.totals.openingBalance)}원 vs 은행 ${formatNum(bankOpening)}원 (차이 ${formatNum(APP.fundData.totals.openingBalance - bankOpening)}원)` });
@@ -2916,10 +2971,27 @@ const genBankInput = document.getElementById('genBankInput');
 const genBankBox = document.getElementById('genBankUploadBox');
 let genBankFiles = []; // 누적 은행 파일 배열
 
+// 여러 은행 파일을 순차 업로드 (PDF/OCR 파싱이 무거워 직렬화 필요)
+async function handleGenBankFilesSequential(files) {
+    for (const file of files) {
+        try {
+            await handleGenBankFile(file);
+        } catch (err) {
+            console.error('[genBank upload]', file.name, err);
+        }
+    }
+}
+
 genBankBox.addEventListener('dragover', e => { e.preventDefault(); genBankBox.classList.add('dragover'); });
 genBankBox.addEventListener('dragleave', () => genBankBox.classList.remove('dragover'));
-genBankBox.addEventListener('drop', e => { e.preventDefault(); genBankBox.classList.remove('dragover'); if (e.dataTransfer.files.length) handleGenBankFile(e.dataTransfer.files[0]); });
-genBankInput.addEventListener('change', e => { if (e.target.files.length) handleGenBankFile(e.target.files[0]); e.target.value = ''; });
+genBankBox.addEventListener('drop', e => {
+    e.preventDefault(); genBankBox.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleGenBankFilesSequential(Array.from(e.dataTransfer.files));
+});
+genBankInput.addEventListener('change', e => {
+    if (e.target.files.length) handleGenBankFilesSequential(Array.from(e.target.files));
+    e.target.value = '';
+});
 
 async function handleGenBankFile(file) {
     const ext = file.name.split('.').pop().toLowerCase();
@@ -2938,14 +3010,8 @@ async function handleGenBankFile(file) {
             if (rows.length === 0) showToast('이미지에서 거래를 감지하지 못했습니다. 선명한 이미지를 사용하세요.', 'warning');
         } else if (ext === 'pdf') {
             if (typeof pdfjsLib === 'undefined') { showToast('PDF.js를 로드하지 못했습니다', 'error'); hideLoading(); return; }
-            const buf = await file.arrayBuffer();
-            const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-            let text = '';
-            for (let i = 1; i <= pdf.numPages; i++) {
-                const page = await pdf.getPage(i);
-                const tc = await page.getTextContent();
-                text += tc.items.map(it => it.str).join(' ') + '\n';
-            }
+            // 줄 단위(Y좌표) 그룹핑 사용 — 단순 join은 표를 한 줄로 뭉쳐버려 0건 인식됨
+            const text = await extractPdfTextLineAware(file);
             const parsed = parseBankPDF(text);
             headers = parsed.headers;
             rows = parsed.rows;
@@ -3072,14 +3138,78 @@ function generateFundReport() {
     const fmtAmt = (n) => formatNum(Math.round(n / unitDiv));
 
     const significantTx = transactions.filter(tx => tx.isSignificant);
+    const calcClosing = prevBalance + totalDeposit - totalWithdrawal;
+    const format = document.getElementById('genFormat')?.value || 'summary';
 
-    let html = `<div id="genReportPrintArea" style="font-family: 'Malgun Gothic', sans-serif;">`;
-    html += `<div style="text-align:center; margin-bottom:24px;">`;
-    html += `<h2 style="margin:0 0 4px; font-size:22px;">자 금 일 보</h2>`;
-    html += `<p style="margin:0; font-size:13px; color:#666;">${escapeHtml(company)} | 보고일: ${escapeHtml(reportDate)} | 단위: ${unitLabel}</p>`;
-    html += `</div>`;
+    const rpt = {
+        transactions, totalDeposit, totalWithdrawal, prevBalance,
+        closingBalance: closingBalance != null ? closingBalance : calcClosing,
+        company, reportDate, unitDiv, unitLabel, groups,
+        highlightThreshold, significantTx, fmtAmt, format
+    };
 
-    // Summary table
+    let html;
+    if (format === 'ledger') {
+        html = renderLedgerFormat(rpt);
+    } else if (format === 'category') {
+        html = renderCategoryFormat(rpt);
+    } else {
+        html = renderSummaryFormat(rpt);
+    }
+
+    document.getElementById('genReportContent').innerHTML = html;
+    document.getElementById('genResultCard').classList.remove('hidden');
+    const formatLabel = format === 'ledger' ? '시계열 Ledger형' : (format === 'category' ? '분류형' : '요약형');
+    showToast(`자금일보 생성 완료 [${formatLabel}] (주요 거래 ${significantTx.length}건 표시)`);
+
+    APP.generatedReport = rpt;
+}
+
+// =========================================================
+// 자금일보 포맷별 렌더링 함수 (3종: summary / ledger / category)
+// =========================================================
+
+// 거래 적요로부터 카테고리 추론 (분류형 포맷에서 사용)
+function classifyGenTx(tx) {
+    const desc = (tx.description || '').toLowerCase();
+    const isIncome = tx.deposit > tx.withdrawal;
+    if (isIncome) {
+        if (/외화|해외|환/i.test(desc)) return '외화수입';
+        if (/이자|배당/i.test(desc)) return '이자수익';
+        if (/매출|회수|수금/i.test(desc)) return '매출수금';
+        return '기타수입';
+    } else {
+        if (/소득세|부가세|법인세|지방세|국민연금|건강보험/i.test(desc)) return '세금·공과';
+        if (/외상대|매입.*결제|원자재.*결제|부품.*결제|결제.*거래처|거래처.*결제/i.test(desc)) return '외상대 결제';
+        if (/급여|상여|급상여|급\/?상여|인건/i.test(desc)) return '인건비';
+        if (/임대|임차|월세/i.test(desc)) return '임대료';
+        if (/통신|전화|인터넷|sms/i.test(desc)) return '통신비';
+        if (/사무용품|소모|문구|용품/i.test(desc)) return '사무용품';
+        if (/환차|환산|환율/i.test(desc)) return '환차손';
+        return '기타지출';
+    }
+}
+
+function renderHeader(rpt, formatLabel) {
+    let h = `<div id="genReportPrintArea" style="font-family: 'Malgun Gothic', sans-serif;">`;
+    h += `<div style="text-align:center; margin-bottom:24px;">`;
+    h += `<h2 style="margin:0 0 4px; font-size:22px;">자 금 일 보 <span style="font-size:13px; color:#666; font-weight:normal;">[${formatLabel}]</span></h2>`;
+    h += `<p style="margin:0; font-size:13px; color:#666;">${escapeHtml(rpt.company)} | 보고일: ${escapeHtml(rpt.reportDate)} | 단위: ${rpt.unitLabel}</p>`;
+    h += `</div>`;
+    return h;
+}
+
+function renderFooter() {
+    return `<p style="margin-top:16px; font-size:11px; color:#888; text-align:right;">생성일시: ${new Date().toLocaleString('ko-KR')} | 자금일보 검증기 Pro 자동 생성</p></div>`;
+}
+
+// === 포맷 1: 요약형 (기본) ===
+function renderSummaryFormat(rpt) {
+    const { transactions, groups, totalDeposit, totalWithdrawal, prevBalance, closingBalance,
+            unitLabel, highlightThreshold, significantTx, fmtAmt } = rpt;
+    let html = renderHeader(rpt, '요약형');
+
+    // 계좌별 합계 표
     html += `<table style="width:100%; border-collapse:collapse; margin-bottom:20px; font-size:13px;">`;
     html += `<thead><tr style="background:#f1f5f9;">`;
     html += `<th style="border:1px solid #ddd; padding:8px;">구분</th>`;
@@ -3089,45 +3219,35 @@ function generateFundReport() {
     html += `<th style="border:1px solid #ddd; padding:8px; text-align:right;">당일잔액</th>`;
     html += `</tr></thead><tbody>`;
 
-    const sortedKeys = Object.keys(groups).sort();
-    for (const key of sortedKeys) {
+    for (const key of Object.keys(groups).sort()) {
         const g = groups[key];
-        const gPrev = g.lastBalance != null ? g.lastBalance - g.deposit + g.withdrawal : '-';
-        const gBal = g.lastBalance != null ? g.lastBalance : '-';
+        const gPrev = g.lastBalance != null ? g.lastBalance - g.deposit + g.withdrawal : null;
+        const gBal = g.lastBalance != null ? g.lastBalance : null;
         html += `<tr>`;
         html += `<td style="border:1px solid #ddd; padding:8px;">${escapeHtml(key)}</td>`;
-        html += `<td style="border:1px solid #ddd; padding:8px; text-align:right;">${gPrev !== '-' ? fmtAmt(gPrev) : '-'}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:8px; text-align:right;">${gPrev != null ? fmtAmt(gPrev) : '-'}</td>`;
         html += `<td style="border:1px solid #ddd; padding:8px; text-align:right; color:#1e40af;">${fmtAmt(g.deposit)}</td>`;
         html += `<td style="border:1px solid #ddd; padding:8px; text-align:right; color:#dc2626;">${fmtAmt(g.withdrawal)}</td>`;
-        html += `<td style="border:1px solid #ddd; padding:8px; text-align:right; font-weight:600;">${gBal !== '-' ? fmtAmt(gBal) : '-'}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:8px; text-align:right; font-weight:600;">${gBal != null ? fmtAmt(gBal) : '-'}</td>`;
         html += `</tr>`;
     }
-
-    const calcClosing = prevBalance + totalDeposit - totalWithdrawal;
     html += `<tr style="background:#f8fafc; font-weight:700;">`;
     html += `<td style="border:1px solid #ddd; padding:8px;">합 계</td>`;
     html += `<td style="border:1px solid #ddd; padding:8px; text-align:right;">${fmtAmt(prevBalance)}</td>`;
     html += `<td style="border:1px solid #ddd; padding:8px; text-align:right; color:#1e40af;">${fmtAmt(totalDeposit)}</td>`;
     html += `<td style="border:1px solid #ddd; padding:8px; text-align:right; color:#dc2626;">${fmtAmt(totalWithdrawal)}</td>`;
-    html += `<td style="border:1px solid #ddd; padding:8px; text-align:right;">${fmtAmt(closingBalance != null ? closingBalance : calcClosing)}</td>`;
+    html += `<td style="border:1px solid #ddd; padding:8px; text-align:right;">${fmtAmt(closingBalance)}</td>`;
     html += `</tr></tbody></table>`;
 
-    // 주요 입출금 내역 섹션
+    // 주요 거래
     if (significantTx.length > 0) {
         html += `<div style="margin:20px 0; padding:16px; background:#fffbeb; border:1px solid #f59e0b; border-radius:8px;">`;
         html += `<h4 style="margin:0 0 12px; font-size:14px; color:#92400e;">⭐ 주요 입출금 내역 (기준: ${fmtAmt(highlightThreshold)}${unitLabel} 이상, ${significantTx.length}건)</h4>`;
         html += `<table style="width:100%; border-collapse:collapse; font-size:12px;">`;
-        html += `<thead><tr style="background:#fef3c7;">`;
-        html += `<th style="border:1px solid #fbbf24; padding:6px;">No</th>`;
-        html += `<th style="border:1px solid #fbbf24; padding:6px;">거래일</th>`;
-        html += `<th style="border:1px solid #fbbf24; padding:6px;">출처</th>`;
-        html += `<th style="border:1px solid #fbbf24; padding:6px;">적요</th>`;
-        html += `<th style="border:1px solid #fbbf24; padding:6px;">구분</th>`;
-        html += `<th style="border:1px solid #fbbf24; padding:6px; text-align:right;">금액</th>`;
-        html += `</tr></thead><tbody>`;
+        html += `<thead><tr style="background:#fef3c7;"><th style="border:1px solid #fbbf24; padding:6px;">No</th><th style="border:1px solid #fbbf24; padding:6px;">거래일</th><th style="border:1px solid #fbbf24; padding:6px;">출처</th><th style="border:1px solid #fbbf24; padding:6px;">적요</th><th style="border:1px solid #fbbf24; padding:6px;">구분</th><th style="border:1px solid #fbbf24; padding:6px; text-align:right;">금액</th></tr></thead><tbody>`;
         significantTx.forEach((tx, i) => {
             const type = tx.deposit > tx.withdrawal ? '입금' : '출금';
-            const amt = tx.deposit > tx.withdrawal ? tx.deposit : tx.withdrawal;
+            const amt = type === '입금' ? tx.deposit : tx.withdrawal;
             const typeColor = type === '입금' ? '#1e40af' : '#dc2626';
             html += `<tr>`;
             html += `<td style="border:1px solid #fbbf24; padding:6px; text-align:center;">${i + 1}</td>`;
@@ -3143,20 +3263,10 @@ function generateFundReport() {
         html += `</div>`;
     }
 
-    // Detail table
+    // 거래 상세
     html += `<h4 style="margin:20px 0 8px; font-size:14px;">거래 상세 내역 (총 ${transactions.length}건)</h4>`;
     html += `<table style="width:100%; border-collapse:collapse; font-size:12px;">`;
-    html += `<thead><tr style="background:#f1f5f9;">`;
-    html += `<th style="border:1px solid #ddd; padding:6px;">No</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px;">거래일</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px;">출처(은행)</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px;">적요</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">입금</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">출금</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">잔액</th>`;
-    html += `<th style="border:1px solid #ddd; padding:6px; text-align:center;">주요</th>`;
-    html += `</tr></thead><tbody>`;
-
+    html += `<thead><tr style="background:#f1f5f9;"><th style="border:1px solid #ddd; padding:6px;">No</th><th style="border:1px solid #ddd; padding:6px;">거래일</th><th style="border:1px solid #ddd; padding:6px;">출처(은행)</th><th style="border:1px solid #ddd; padding:6px;">적요</th><th style="border:1px solid #ddd; padding:6px; text-align:right;">입금</th><th style="border:1px solid #ddd; padding:6px; text-align:right;">출금</th><th style="border:1px solid #ddd; padding:6px; text-align:right;">잔액</th><th style="border:1px solid #ddd; padding:6px; text-align:center;">주요</th></tr></thead><tbody>`;
     transactions.forEach((tx, i) => {
         const rowStyle = tx.isSignificant ? 'background:#fffbeb;' : '';
         html += `<tr style="${rowStyle}">`;
@@ -3170,16 +3280,156 @@ function generateFundReport() {
         html += `<td style="border:1px solid #ddd; padding:6px; text-align:center;">${tx.isSignificant ? '⭐' : ''}</td>`;
         html += `</tr>`;
     });
-
     html += `</tbody></table>`;
-    html += `<p style="margin-top:16px; font-size:11px; color:#888; text-align:right;">생성일시: ${new Date().toLocaleString('ko-KR')} | 자금일보 검증기 Pro 자동 생성</p>`;
+    html += renderFooter();
+    return html;
+}
+
+// === 포맷 2: 시계열 Ledger형 (시간순 한 줄 한 거래) ===
+function renderLedgerFormat(rpt) {
+    const { transactions, totalDeposit, totalWithdrawal, prevBalance, closingBalance,
+            unitLabel, fmtAmt } = rpt;
+
+    // 거래일 + 시간 기준 정렬
+    const sorted = [...transactions].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+    let html = renderHeader(rpt, '시계열 Ledger형');
+
+    // 메타 박스
+    html += `<table style="width:100%; border-collapse:collapse; margin-bottom:16px; font-size:13px;">`;
+    html += `<tr><td style="background:#f1f5f9; padding:8px; border:1px solid #ddd; font-weight:600; width:120px;">기초 시재</td>`;
+    html += `<td style="padding:8px; border:1px solid #ddd; text-align:right;">${fmtAmt(prevBalance)} ${unitLabel}</td>`;
+    html += `<td style="background:#f1f5f9; padding:8px; border:1px solid #ddd; font-weight:600; width:120px;">마감 시재</td>`;
+    html += `<td style="padding:8px; border:1px solid #ddd; text-align:right;">${fmtAmt(closingBalance)} ${unitLabel}</td></tr>`;
+    html += `<tr><td style="background:#f1f5f9; padding:8px; border:1px solid #ddd; font-weight:600;">입금 합계</td>`;
+    html += `<td style="padding:8px; border:1px solid #ddd; text-align:right; color:#1e40af;">${fmtAmt(totalDeposit)} ${unitLabel}</td>`;
+    html += `<td style="background:#f1f5f9; padding:8px; border:1px solid #ddd; font-weight:600;">출금 합계</td>`;
+    html += `<td style="padding:8px; border:1px solid #ddd; text-align:right; color:#dc2626;">${fmtAmt(totalWithdrawal)} ${unitLabel}</td></tr>`;
+    html += `</table>`;
+
+    // 시계열 표
+    html += `<h4 style="margin:20px 0 8px; font-size:14px;">자금일계표 (시간순, 총 ${sorted.length}건)</h4>`;
+    html += `<table style="width:100%; border-collapse:collapse; font-size:12px;">`;
+    html += `<thead><tr style="background:#f1f5f9;">`;
+    html += `<th style="border:1px solid #ddd; padding:6px;">No</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px;">거래일시</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px;">구분</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px;">출처(은행)</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px;">적요</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">수입</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">지출</th>`;
+    html += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">잔액</th>`;
+    html += `</tr></thead><tbody>`;
+    sorted.forEach((tx, i) => {
+        const isIncome = tx.deposit > tx.withdrawal;
+        const kind = isIncome ? '수입' : '지출';
+        const kindColor = isIncome ? '#059669' : '#dc2626';
+        const rowStyle = isIncome ? 'background:#f0fdf4;' : 'background:#fef2f2;';
+        html += `<tr style="${rowStyle}">`;
+        html += `<td style="border:1px solid #ddd; padding:6px; text-align:center;">${i + 1}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px;">${escapeHtml(tx.date)}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px; text-align:center; color:${kindColor}; font-weight:600;">${kind}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px;">${escapeHtml(tx.bankLabel || tx.account)}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px;">${escapeHtml(tx.description)}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px; text-align:right; color:#1e40af;">${tx.deposit > 0 ? fmtAmt(tx.deposit) : '-'}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px; text-align:right; color:#dc2626;">${tx.withdrawal > 0 ? fmtAmt(tx.withdrawal) : '-'}</td>`;
+        html += `<td style="border:1px solid #ddd; padding:6px; text-align:right;">${tx.balance != null ? fmtAmt(tx.balance) : '-'}</td>`;
+        html += `</tr>`;
+    });
+    // 합계 행
+    html += `<tr style="background:#f8fafc; font-weight:700;">`;
+    html += `<td colspan="5" style="border:1px solid #ddd; padding:6px; text-align:center;">합 계</td>`;
+    html += `<td style="border:1px solid #ddd; padding:6px; text-align:right; color:#1e40af;">${fmtAmt(totalDeposit)}</td>`;
+    html += `<td style="border:1px solid #ddd; padding:6px; text-align:right; color:#dc2626;">${fmtAmt(totalWithdrawal)}</td>`;
+    html += `<td style="border:1px solid #ddd; padding:6px;"></td>`;
+    html += `</tr></tbody></table>`;
+    html += renderFooter();
+    return html;
+}
+
+// === 포맷 3: 분류형 (수입/지출 그룹 + 계정과목별) ===
+function renderCategoryFormat(rpt) {
+    const { transactions, totalDeposit, totalWithdrawal, prevBalance, closingBalance,
+            unitLabel, fmtAmt } = rpt;
+
+    // 카테고리 분류 → {수입: {매출수금: [tx, ...], ...}, 지출: {...}}
+    const incomeGroups = {};
+    const expenseGroups = {};
+    transactions.forEach(tx => {
+        const isIncome = tx.deposit > tx.withdrawal;
+        const cat = classifyGenTx(tx);
+        const target = isIncome ? incomeGroups : expenseGroups;
+        if (!target[cat]) target[cat] = [];
+        target[cat].push(tx);
+    });
+
+    let html = renderHeader(rpt, '분류형');
+
+    // 메타
+    html += `<table style="width:100%; border-collapse:collapse; margin-bottom:16px; font-size:13px;">`;
+    html += `<tr><td style="background:#f1f5f9; padding:8px; border:1px solid #ddd; font-weight:600; width:120px;">기초 시재</td>`;
+    html += `<td style="padding:8px; border:1px solid #ddd; text-align:right;">${fmtAmt(prevBalance)} ${unitLabel}</td>`;
+    html += `<td style="background:#f1f5f9; padding:8px; border:1px solid #ddd; font-weight:600; width:120px;">마감 시재</td>`;
+    html += `<td style="padding:8px; border:1px solid #ddd; text-align:right;">${fmtAmt(closingBalance)} ${unitLabel}</td></tr></table>`;
+
+    // 수입/지출 섹션
+    const renderSection = (label, groups, color, totalLabel, total) => {
+        let s = `<h4 style="margin:20px 0 8px; font-size:14px; color:${color};">▣ ${label} (${totalLabel}: ${fmtAmt(total)} ${unitLabel})</h4>`;
+        if (Object.keys(groups).length === 0) {
+            s += `<p style="font-size:12px; color:#888; padding:8px;">(없음)</p>`;
+            return s;
+        }
+        s += `<table style="width:100%; border-collapse:collapse; font-size:12px;">`;
+        s += `<thead><tr style="background:#f1f5f9;">`;
+        s += `<th style="border:1px solid #ddd; padding:6px;">계정과목</th>`;
+        s += `<th style="border:1px solid #ddd; padding:6px;">거래처/적요</th>`;
+        s += `<th style="border:1px solid #ddd; padding:6px;">출처(은행)</th>`;
+        s += `<th style="border:1px solid #ddd; padding:6px;">거래일</th>`;
+        s += `<th style="border:1px solid #ddd; padding:6px; text-align:right;">금액</th>`;
+        s += `</tr></thead><tbody>`;
+        // 카테고리별 그룹 합계 큰 순
+        const cats = Object.keys(groups).sort((a, b) => {
+            const sumB = groups[b].reduce((acc, t) => acc + Math.max(t.deposit, t.withdrawal), 0);
+            const sumA = groups[a].reduce((acc, t) => acc + Math.max(t.deposit, t.withdrawal), 0);
+            return sumB - sumA;
+        });
+        for (const cat of cats) {
+            const items = groups[cat];
+            const subtotal = items.reduce((acc, t) => acc + Math.max(t.deposit, t.withdrawal), 0);
+            // 카테고리 헤더 행
+            s += `<tr style="background:#fafafa;"><td colspan="4" style="border:1px solid #ddd; padding:6px; font-weight:700;">${escapeHtml(cat)} <span style="font-weight:400; color:#666;">(${items.length}건)</span></td>`;
+            s += `<td style="border:1px solid #ddd; padding:6px; text-align:right; font-weight:700; color:${color};">${fmtAmt(subtotal)}</td></tr>`;
+            // 개별 거래
+            items.forEach(tx => {
+                const amt = Math.max(tx.deposit, tx.withdrawal);
+                s += `<tr>`;
+                s += `<td style="border:1px solid #ddd; padding:6px; padding-left:18px; color:#666;">└</td>`;
+                s += `<td style="border:1px solid #ddd; padding:6px;">${escapeHtml(tx.description)}</td>`;
+                s += `<td style="border:1px solid #ddd; padding:6px;">${escapeHtml(tx.bankLabel || tx.account)}</td>`;
+                s += `<td style="border:1px solid #ddd; padding:6px;">${escapeHtml(tx.date)}</td>`;
+                s += `<td style="border:1px solid #ddd; padding:6px; text-align:right; color:${color};">${fmtAmt(amt)}</td>`;
+                s += `</tr>`;
+            });
+        }
+        // 합계
+        s += `<tr style="background:#f8fafc; font-weight:700;">`;
+        s += `<td colspan="4" style="border:1px solid #ddd; padding:6px;">${label} 합계</td>`;
+        s += `<td style="border:1px solid #ddd; padding:6px; text-align:right; color:${color};">${fmtAmt(total)}</td>`;
+        s += `</tr></tbody></table>`;
+        return s;
+    };
+
+    html += renderSection('수입', incomeGroups, '#1e40af', '입금 합계', totalDeposit);
+    html += renderSection('지출', expenseGroups, '#dc2626', '출금 합계', totalWithdrawal);
+
+    // 손익 요약
+    const net = totalDeposit - totalWithdrawal;
+    const netColor = net >= 0 ? '#059669' : '#dc2626';
+    html += `<div style="margin-top:20px; padding:12px; background:#f8fafc; border:1px solid #ddd; border-radius:6px; text-align:right; font-size:13px;">`;
+    html += `<span style="font-weight:600;">금일 순증감:</span> <span style="font-weight:700; color:${netColor}; font-size:15px;">${net >= 0 ? '+' : ''}${fmtAmt(net)} ${unitLabel}</span>`;
     html += `</div>`;
-
-    document.getElementById('genReportContent').innerHTML = html;
-    document.getElementById('genResultCard').classList.remove('hidden');
-    showToast(`자금일보 생성 완료 (주요 거래 ${significantTx.length}건 표시)`);
-
-    APP.generatedReport = { transactions, totalDeposit, totalWithdrawal, prevBalance, closingBalance: closingBalance != null ? closingBalance : calcClosing, company, reportDate, unitDiv, unitLabel, groups, highlightThreshold, significantTx };
+    html += renderFooter();
+    return html;
 }
 
 function exportGenerated(format) {
