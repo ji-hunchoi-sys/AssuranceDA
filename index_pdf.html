@@ -366,10 +366,10 @@
     let serverConnected = false;
 
     // ── 전체 검색결과 감사인 스캔 상태 ──
-    const SCAN_INITIAL_API_PAGES = 20;   // 1회 스캔 단위 (1 backend page = DART 5페이지) → 100 DART 페이지
+    const SCAN_INITIAL_API_PAGES = 20;   // 1회(=1차) 스캔 단위 (1 backend page = DART 5페이지) → 100 DART 페이지
     const SCAN_AUDITOR_BATCH = 10;       // 감사인 추출 배치 크기
     const SCAN_API_PAGE_SIZE = 500;      // 백엔드 page 1회당 최대 반환 건수
-    let scanState = null;                // {active, done, cancelled, records, seenRcept, auditors, extractedRcepts, pagesScanned, pageLimit, hasMoreOnDart, controller, ctx, multiKw, primaryKeyword}
+    let scanState = null;                // {active, done, cancelled, records, seenRcept, auditors, pagesScanned, pageLimit, hasMoreOnDart, controller, ctx, multiKw, primaryKeyword}
     let pageResultsBackup = null;        // 스캔 뷰 진입 시 페이지 뷰 결과 백업 (null = 페이지 뷰 활성)
 
     // ── 초기화 ──
@@ -827,7 +827,6 @@
         records: [],
         seenRcept: new Set(),
         auditors: {},
-        extractedRcepts: new Set(),
         pagesScanned: 0,
         pageLimit: SCAN_INITIAL_API_PAGES,  // 동적 확장 가능
         hasMoreOnDart: false,               // 마지막 fetch에서 has_next=true였는지
@@ -840,25 +839,31 @@
         auditVerified: {},                  // rcept_no → {matched, in_audit, in_consolidated, ...}
         auditCheckedRcepts: new Set(),      // verify 큐에 이미 enqueue한 rcept_no
         droppedByAuditCheck: 0,
-        // ── 백그라운드 워커 ──
-        verifyQueue: [],                    // verify 대기 rcept_no
-        extractQueue: [],                   // extract 대기 rcept_no
-        verifyWorkerRunning: false,
-        extractWorkerRunning: false,
+        // ── 백그라운드 워커 (auditor + audit_check 통합) ──
+        analyzeQueue: [],                   // /api/analyze-filings 대기 rcept_no
+        analyzeWorkerRunning: false,
+        analyzeFailed: new Set(),           // 분석 영구 실패 처리된 rcept_no (재시도 안 함)
+        round: 1,                           // 현재 스캔 회차 (extendScan 호출마다 증가)
       };
 
       // 이미 로드된 첫 페이지 결과를 시드로 활용
       const seed = pageResultsBackup || currentResults || [];
+      const seededNewly = [];
       seed.forEach(r => {
         if (r.rcept_no && !scanState.seenRcept.has(r.rcept_no)) {
           scanState.records.push(r);
           scanState.seenRcept.add(r.rcept_no);
           const a = r.auditor || allAuditors[r.rcept_no];
           if (a) scanState.auditors[r.rcept_no] = a;
+          seededNewly.push(r);
         }
       });
 
       showScanBanner();
+      // 시드 record도 분석 큐에 넣어야 함. scanLoop는 동일 rcept_no를 seenRcept로 걸러내므로
+      // 여기서 enqueue하지 않으면 시드 3건의 audit_check/auditor 분석이 영구적으로 누락됨.
+      _enqueueWorkForBatch(seededNewly);
+
       scanLoop().catch(err => {
         console.warn('스캔 루프 오류:', err);
         if (scanState) scanState.active = false;
@@ -867,68 +872,99 @@
     }
 
     // ══════════════════════════════════════════════════
-    // ── 백그라운드 워커: verify / extract ──
-    // scanLoop와 독립적으로 큐를 처리. UI는 scan + workers 모두 종료될 때 "완료" 상태가 됨.
+    // ── 백그라운드 워커: 통합 analyze (auditor + audit_check) ──
+    // /api/analyze-filings를 호출. 동일 XML을 1회만 다운로드해 OpenDART 부하를 절반으로 낮춤.
     // ══════════════════════════════════════════════════
 
     function getVerifyKeywords() {
+      if (!scanState) return [];
       const andTerms = (scanState.multiKw || []).filter(k => k.op === 'AND').map(k => k.term);
       return andTerms.length > 0 ? andTerms : [scanState.primaryKeyword];
     }
 
-    async function _checkAuditContentBatch(rceptNos, keywords, signal) {
-      const resp = await fetchWithTimeout(`${API_BASE}/check-audit-content`, {
+    async function _analyzeBatch(rceptNos, keywords, wantAuditCheck, signal) {
+      const resp = await fetchWithTimeout(`${API_BASE}/analyze-filings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rcept_nos: rceptNos, keywords }),
+        body: JSON.stringify({ rcept_nos: rceptNos, keywords, audit_check: !!wantAuditCheck }),
         signal,
-      }, 90000);
+      }, 120000);   // XML 8건 시퀀셜 다운로드 시간 고려해 넉넉히
+      if (!resp.ok) throw new Error('analyze HTTP ' + resp.status);
       const data = await resp.json();
       return (data && data.results) ? data.results : {};
     }
 
-    async function runVerifyWorker() {
-      if (!scanState || scanState.verifyWorkerRunning) return;
-      scanState.verifyWorkerRunning = true;
+    function _applyAnalyzeResult(rcept, entry) {
+      if (!scanState || !rcept || !entry) return;
+      // auditor 적용
+      if (typeof entry.auditor === 'string') {
+        scanState.auditors[rcept] = entry.auditor;
+        if (entry.auditor) allAuditors[rcept] = entry.auditor;
+      }
+      // audit_check 적용 (audit_only 모드일 때만 의미)
+      if (entry.audit_check) {
+        scanState.auditVerified[rcept] = entry.audit_check;
+      }
+    }
+
+    async function runAnalyzeWorker() {
+      if (!scanState || scanState.analyzeWorkerRunning) return;
+      scanState.analyzeWorkerRunning = true;
       try {
         while (scanState && !scanState.cancelled) {
-          if (scanState.verifyQueue.length === 0) {
-            // scanLoop도 끝났고 큐도 비었으면 종료
+          if (scanState.analyzeQueue.length === 0) {
+            // 스캔도 끝났고 큐도 비었으면 종료. 스캔이 아직 active면 새 항목 기다림.
             if (!scanState.active) break;
             await new Promise(r => setTimeout(r, 250));
             continue;
           }
 
-          const batch = scanState.verifyQueue.splice(0, 8);
-          const keywords = getVerifyKeywords();
+          // 큐에서 8건 pop. 이미 실패 마킹된 항목은 스킵.
+          const batch = [];
+          while (batch.length < 8 && scanState.analyzeQueue.length > 0) {
+            const r = scanState.analyzeQueue.shift();
+            if (!scanState.analyzeFailed.has(r)) batch.push(r);
+          }
+          if (batch.length === 0) continue;
+
+          const wantAuditCheck = !!scanState.auditOnly;
+          const keywords = wantAuditCheck ? getVerifyKeywords() : [];
 
           let results = {};
           try {
-            results = await _checkAuditContentBatch(batch, keywords, scanState.controller.signal);
+            results = await _analyzeBatch(batch, keywords, wantAuditCheck, scanState.controller.signal);
           } catch (err) {
             if (err.name === 'AbortError') break;
-            console.warn('verify worker batch 실패, 1건씩 재시도', err);
+            console.warn('analyze worker batch 실패, 1건씩 재시도', err);
           }
 
-          // 응답에 빠진 rcept_no는 1건씩 재시도 → 그래도 실패하면 error 표기
+          // 응답에 빠진 rcept_no는 1건씩 재시도 → 그래도 실패하면 error 마킹
           for (const rcept of batch) {
             if (results[rcept]) {
-              scanState.auditVerified[rcept] = results[rcept];
+              _applyAnalyzeResult(rcept, results[rcept]);
               continue;
             }
             if (scanState.cancelled) break;
             try {
-              const single = await _checkAuditContentBatch([rcept], keywords, scanState.controller.signal);
-              scanState.auditVerified[rcept] = single[rcept] || {
-                matched: false, in_audit: false, in_consolidated: false,
-                has_audit_section: false, has_consolidated_section: false, error: true,
-              };
+              const single = await _analyzeBatch([rcept], keywords, wantAuditCheck, scanState.controller.signal);
+              if (single[rcept]) {
+                _applyAnalyzeResult(rcept, single[rcept]);
+              } else {
+                throw new Error('empty result');
+              }
             } catch (err) {
               if (err.name === 'AbortError') break;
-              scanState.auditVerified[rcept] = {
-                matched: false, in_audit: false, in_consolidated: false,
-                has_audit_section: false, has_consolidated_section: false, error: true,
-              };
+              // 영구 실패: 더 이상 재시도 안 함
+              scanState.analyzeFailed.add(rcept);
+              if (wantAuditCheck) {
+                scanState.auditVerified[rcept] = {
+                  matched: false, in_audit: false, in_consolidated: false,
+                  has_audit_section: false, has_consolidated_section: false, error: true,
+                };
+              }
+              if (scanState.auditors[rcept] === undefined) {
+                scanState.auditors[rcept] = '';
+              }
             }
           }
 
@@ -942,49 +978,7 @@
         }
       } finally {
         if (scanState) {
-          scanState.verifyWorkerRunning = false;
-          updateScanBanner();
-        }
-      }
-    }
-
-    async function runExtractWorker() {
-      if (!scanState || scanState.extractWorkerRunning) return;
-      scanState.extractWorkerRunning = true;
-      try {
-        while (scanState && !scanState.cancelled) {
-          if (scanState.extractQueue.length === 0) {
-            if (!scanState.active) break;
-            await new Promise(r => setTimeout(r, 250));
-            continue;
-          }
-
-          const batch = scanState.extractQueue.splice(0, SCAN_AUDITOR_BATCH);
-          try {
-            const resp = await fetchWithTimeout(`${API_BASE}/extract-auditors`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ rcept_nos: batch }),
-              signal: scanState.controller.signal,
-            }, 90000);
-            const ed = await resp.json();
-            if (ed && ed.auditors) {
-              Object.entries(ed.auditors).forEach(([rcept, auditor]) => {
-                scanState.auditors[rcept] = auditor || '';
-                if (auditor) allAuditors[rcept] = auditor;
-              });
-            }
-          } catch (err) {
-            if (err.name === 'AbortError') break;
-            console.warn('extract worker batch 실패', err);
-          }
-
-          if (pageResultsBackup !== null) rerenderScanResults();
-          updateScanBanner();
-        }
-      } finally {
-        if (scanState) {
-          scanState.extractWorkerRunning = false;
+          scanState.analyzeWorkerRunning = false;
           updateScanBanner();
         }
       }
@@ -993,7 +987,7 @@
     function _enqueueWorkForBatch(newlyAdded) {
       if (!scanState) return;
 
-      // 외부감사 타입은 자체가 감사보고서이므로 검증 면제
+      // 외부감사 타입(F)은 자체가 감사보고서 → 검증 면제
       if (scanState.auditOnly) {
         newlyAdded.filter(r => isFilingAlreadyAudit(r)).forEach(r => {
           scanState.auditVerified[r.rcept_no] = {
@@ -1002,30 +996,31 @@
             exempt: true,
           };
         });
-
-        const toVerify = newlyAdded
-          .filter(r => !isFilingAlreadyAudit(r) && !scanState.auditCheckedRcepts.has(r.rcept_no))
-          .map(r => r.rcept_no);
-        toVerify.forEach(r => scanState.auditCheckedRcepts.add(r));
-        if (toVerify.length > 0) {
-          scanState.verifyQueue.push(...toVerify);
-          if (!scanState.verifyWorkerRunning) {
-            runVerifyWorker().catch(err => console.warn('verify worker error', err));
-          }
-        }
       }
 
-      const needExtract = newlyAdded
-        .filter(r => r.rcept_no
-          && (r.filing_type || '').includes('정기공시')
-          && !scanState.auditors[r.rcept_no]
-          && !scanState.extractedRcepts.has(r.rcept_no))
-        .map(r => r.rcept_no);
-      needExtract.forEach(r => scanState.extractedRcepts.add(r));
-      if (needExtract.length > 0) {
-        scanState.extractQueue.push(...needExtract);
-        if (!scanState.extractWorkerRunning) {
-          runExtractWorker().catch(err => console.warn('extract worker error', err));
+      // analyze가 필요한 record:
+      // - audit_only 모드면 모든 정기공시 (외부감사 제외)에 대해 audit_check 필요
+      // - 항상 정기공시 record에 대해 auditor 추출 필요
+      const toAnalyze = newlyAdded.filter(r => {
+        if (!r.rcept_no) return false;
+        if (isFilingAlreadyAudit(r)) {
+          // 외부감사: 그래도 r.auditor가 있으니 별도 추출 불필요. 큐 안 넣음.
+          if (r.auditor && !scanState.auditors[r.rcept_no]) {
+            scanState.auditors[r.rcept_no] = r.auditor;
+            allAuditors[r.rcept_no] = r.auditor;
+          }
+          return false;
+        }
+        if (!(r.filing_type || '').includes('정기공시')) return false;
+        // 이미 큐에 enqueue된 경우 중복 enqueue 방지
+        return !scanState.auditCheckedRcepts.has(r.rcept_no);
+      }).map(r => r.rcept_no);
+
+      toAnalyze.forEach(r => scanState.auditCheckedRcepts.add(r));
+      if (toAnalyze.length > 0) {
+        scanState.analyzeQueue.push(...toAnalyze);
+        if (!scanState.analyzeWorkerRunning) {
+          runAnalyzeWorker().catch(err => console.warn('analyze worker error', err));
         }
       }
     }
@@ -1118,13 +1113,15 @@
         }
         updateScanBanner();
       }
-      // 주: 워커는 큐를 비울 때까지 백그라운드에서 계속 돌아감
+      // 주: 워커는 큐를 비울 때까지 백그라운드에서 계속 돌아감.
+      // 다음 회차는 사용자가 명시적으로 extendScan 버튼을 눌러야 시작됨.
     }
 
     function extendScan() {
       if (!scanState || scanState.active) return;
       if (!scanState.hasMoreOnDart) return;
       scanState.pageLimit += SCAN_INITIAL_API_PAGES;
+      scanState.round = (scanState.round || 1) + 1;
       scanState.cancelled = false;
       scanState.done = false;
       scanState.active = true;
@@ -1152,35 +1149,6 @@
         // 검색을 다시 실행 (현재 페이지 1)
         doSearch(1);
       }
-    }
-
-    // 키워드들이 (연결)감사보고서 섹션에 포함되는지 백엔드에 일괄 검증 요청
-    // 배치 8건 단위 + 배치당 90초 타임아웃 (XML 다운로드 + 파싱 시간 고려)
-    async function verifyAuditContent(rceptNos, keywords, abortSignal) {
-      if (!rceptNos || rceptNos.length === 0) return {};
-      const all = {};
-      const BATCH = 8;
-      for (let i = 0; i < rceptNos.length; i += BATCH) {
-        if (abortSignal && abortSignal.aborted) break;
-        const batch = rceptNos.slice(i, i + BATCH);
-        try {
-          const resp = await fetchWithTimeout(`${API_BASE}/check-audit-content`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ rcept_nos: batch, keywords }),
-            signal: abortSignal,
-          }, 90000);
-          const data = await resp.json();
-          if (data && data.results) Object.assign(all, data.results);
-          // 진행 중간에 UI 갱신
-          if (scanState && pageResultsBackup !== null) rerenderScanResults();
-          updateScanBanner();
-        } catch (err) {
-          if (err.name === 'AbortError') break;
-          console.warn('감사보고서 본문 검증 배치 실패:', err);
-        }
-      }
-      return all;
     }
 
     // 외부감사(F) 타입 자체는 감사보고서이므로 별도 검증 없이 통과
@@ -1261,8 +1229,7 @@
         : 0;
       const coveragePctRound = Math.round(coveragePctRaw);
 
-      const workersBusy = scanState.verifyWorkerRunning || scanState.extractWorkerRunning ||
-                          scanState.verifyQueue.length > 0 || scanState.extractQueue.length > 0;
+      const workersBusy = scanState.analyzeWorkerRunning || scanState.analyzeQueue.length > 0;
 
       // 진행률바 규칙:
       // - 모든 작업(스캔 + 워커) 끝 + universe 소진 → 100%
@@ -1300,50 +1267,57 @@
         ? `추출 ${recordsCount.toLocaleString()}/${universe.toLocaleString()}건 (${coveragePctText}) · 페이지 ${scanState.pagesScanned}/${pageLimit}`
         : `${recordsCount.toLocaleString()}건 누적 · 페이지 ${scanState.pagesScanned}/${pageLimit}`;
 
-      // 백그라운드 워커 진행 상태
-      const workerNote = (() => {
-        const parts = [];
-        if (scanState.verifyWorkerRunning || scanState.verifyQueue.length > 0) {
-          parts.push(`📑 본문검증 대기 ${scanState.verifyQueue.length}건`);
-        }
-        if (scanState.extractWorkerRunning || scanState.extractQueue.length > 0) {
-          parts.push(`👤 감사인추출 대기 ${scanState.extractQueue.length}건`);
-        }
-        return parts.length > 0 ? ` · ${parts.join(', ')}` : '';
-      })();
+      // 백그라운드 워커 진행 상태 (analyze 통합)
+      // batch 8건 직렬 처리 ≒ 약 16초 가정 (rate limit 0.35초 + XML 다운로드/파싱). 사용자에게 진행감 제공.
+      const queueLen = scanState.analyzeQueue.length;
+      const etaSec = queueLen > 0 ? Math.ceil(queueLen * 2) : 0;
+      const etaText = etaSec >= 60 ? `약 ${Math.ceil(etaSec / 60)}분` : `약 ${etaSec}초`;
+      const workerNote = (scanState.analyzeWorkerRunning || queueLen > 0)
+        ? ` · ⚙️ 분석 대기 ${queueLen}건 (${etaText})${scanState.analyzeFailed.size > 0 ? ` · 실패 ${scanState.analyzeFailed.size}건` : ''}`
+        : '';
 
-      const workersAlive = scanState.verifyWorkerRunning || scanState.extractWorkerRunning;
-      const workersHaveWork = scanState.verifyQueue.length > 0 || scanState.extractQueue.length > 0;
+      const workersAlive = scanState.analyzeWorkerRunning;
+      const workersHaveWork = scanState.analyzeQueue.length > 0;
+
+      const round = scanState.round || 1;
+      const roundLabel = `${round}차`;
+      const nextRoundLabel = `📄 ${round + 1}차 스캔 시작 (다음 100 페이지)`;
 
       if (scanState.active) {
         // 단계 1: scanLoop가 DART 페이지 fetch 중
         spinner.classList.remove('hidden');
         cancelBtn.classList.remove('hidden');
-        statusText.textContent = `🔍 [${filterLabel}] DART 페이지 스캔 중${titleSuffix}`;
+        statusText.textContent = `🔍 [${filterLabel}] ${roundLabel} 스캔 중${titleSuffix}`;
         progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭${workerNote}`;
       } else if (scanState.cancelled) {
         spinner.classList.add('hidden');
         restartBtn.classList.remove('hidden');
-        statusText.textContent = `⏸ 스캔 중단됨${titleSuffix}`;
+        statusText.textContent = `⏸ ${roundLabel} 스캔 중단됨${titleSuffix}`;
         progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
       } else if (workersAlive || workersHaveWork) {
-        // 단계 2: scanLoop는 끝났지만 워커가 큐 처리 중
+        // 단계 2: scanLoop는 끝났지만 분석 워커가 큐 처리 중.
+        // 회차별 명시적 진행이므로 이 단계에서도 사용자가 다음 회차로 넘어갈 수 있게 extendBtn 즉시 노출.
         spinner.classList.remove('hidden');
         cancelBtn.classList.remove('hidden');
-        const workTypes = [];
-        if (scanState.verifyWorkerRunning || scanState.verifyQueue.length > 0) workTypes.push('본문검증');
-        if (scanState.extractWorkerRunning || scanState.extractQueue.length > 0) workTypes.push('감사인추출');
-        statusText.textContent = `⚙️ DART 스캔 완료, 백그라운드 ${workTypes.join('·')} 진행 중${titleSuffix}`;
+        const workLabel = scanState.auditOnly ? '본문검증·감사인추출' : '감사인추출';
+        statusText.textContent = `⚙️ ${roundLabel} DART 스캔 완료, 백그라운드 ${workLabel} 진행 중${titleSuffix}`;
         progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭${workerNote}`;
+        if (scanState.hasMoreOnDart) {
+          extendBtn.classList.remove('hidden');
+          extendBtn.textContent = nextRoundLabel;
+        }
       } else if (scanState.done) {
-        // 단계 3: 모두 완료
+        // 단계 3: 회차 모두 완료 (스캔 + 분석)
         spinner.classList.add('hidden');
         const completeIcon = scanState.hasMoreOnDart ? '📦' : '✅';
-        const completeLabel = scanState.hasMoreOnDart ? '1차 스캔 완료' : '전체 스캔 완료 (DART에 더 이상 신규 결과 없음)';
+        const completeLabel = scanState.hasMoreOnDart
+          ? `${roundLabel} 스캔 완료 — 매칭 ${matchCount}건, 모집단에 더 있음`
+          : `전체 스캔 완료 (DART에 더 이상 신규 결과 없음) — 매칭 ${matchCount}건`;
         statusText.textContent = `${completeIcon} ${completeLabel}${titleSuffix}`;
         progressText.textContent = `${baseProgress}${auditNote} · ${matchCount}건 매칭`;
         if (scanState.hasMoreOnDart) {
           extendBtn.classList.remove('hidden');
+          extendBtn.textContent = nextRoundLabel;
         }
       }
 

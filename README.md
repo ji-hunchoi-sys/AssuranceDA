@@ -65,10 +65,13 @@ python app.py
 |--------|------|------|
 | GET  | `/api/health` | 서버 상태 및 API 키 등록 여부 확인 |
 | GET  | `/api/search` | 키워드/회사명 기반 보고서 검색 (`keyword`, `corp_name`, `start_date`, `end_date`, `dsp_type`, `page`, `max_results`) |
-| POST | `/api/extract-auditors` | 접수번호 배열에 대해 감사인명 일괄 추출 (`rcept_nos`, 최대 5건) |
+| POST | `/api/analyze-filings` | 접수번호 배열에 대해 **감사인 추출 + 감사보고서 본문 키워드 검증을 1회 다운로드로 통합 처리** (`rcept_nos` 최대 20건, `keywords`, `audit_check`) |
+| POST | `/api/extract-auditors` | 접수번호 배열에 대해 감사인명만 일괄 추출 (`rcept_nos`, 최대 5건) |
 | GET  | `/api/extract-auditor/<rcept_no>` | 단일 보고서의 감사인명 추출 |
 | GET  | `/api/document/<rcept_no>` | 보고서 내 섹션(목차) 목록 |
 | GET  | `/api/document/<rcept_no>/content?section=<idx>` | 특정 섹션의 HTML 본문 |
+
+> `/api/analyze-filings` 는 OpenDART `document.xml` 의 zip 첨부에서 `DOCUMENT-NAME` 메타데이터로 사업보고서·감사보고서·연결감사보고서를 분류하여 동일 XML을 1회만 다운로드합니다. `keywords` 가 비어 있으면 감사인 추출만 수행합니다.
 
 ---
 

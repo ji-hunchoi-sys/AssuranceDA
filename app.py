@@ -43,6 +43,10 @@ _XML_CACHE_TTL = 600
 _audit_text_cache = {}
 _AUDIT_TEXT_CACHE_MAX = 200
 
+# 동일 rcept_no에 대한 XML 다운로드 중복 방지 (concurrent 요청 race condition 방어)
+_xml_download_locks = {}
+_xml_locks_meta_lock = threading.Lock()
+
 # ── DART 웹 세션 ──
 _dart_session = None
 _dart_session_lock = threading.Lock()
@@ -334,26 +338,66 @@ def _parse_search_results(html):
 
 # ── 감사인 추출 ──
 
-def _download_document_xml(rcept_no):
+def _get_xml_lock(rcept_no):
+    """rcept_no별 다운로드 락. 동일 XML을 두 번 받지 않도록 직렬화."""
+    with _xml_locks_meta_lock:
+        lock = _xml_download_locks.get(rcept_no)
+        if lock is None:
+            lock = threading.Lock()
+            _xml_download_locks[rcept_no] = lock
+        return lock
+
+
+def _download_filing_documents(rcept_no):
+    """OpenDART document.xml zip 안의 모든 XML을 DOCUMENT-NAME 기준으로 분류해 dict로 반환.
+    예: {'사업보고서': '<DOCUMENT...>', '감사보고서': '<DOCUMENT...>', '연결감사보고서': '<DOCUMENT...>'}
+    캐시는 rcept_no 단위로 적용. 동일 rcept_no에 대해 1회만 다운로드.
+    """
     now = time.time()
     if rcept_no in _xml_cache:
-        cached_time, cached_content = _xml_cache[rcept_no]
+        cached_time, cached_dict = _xml_cache[rcept_no]
         if now - cached_time < _XML_CACHE_TTL:
-            return cached_content
+            return cached_dict
 
-    _rate_limit_api()
-    url = f"{DART_API_BASE}/document.xml"
-    resp = requests.get(url, params={"crtfc_key": API_KEY, "rcept_no": rcept_no}, timeout=60)
-    resp.raise_for_status()
-    z = zipfile.ZipFile(io.BytesIO(resp.content))
-    xml_name = z.namelist()[0]
-    xml_content = z.read(xml_name).decode("utf-8", errors="replace")
+    lock = _get_xml_lock(rcept_no)
+    with lock:
+        if rcept_no in _xml_cache:
+            cached_time, cached_dict = _xml_cache[rcept_no]
+            if time.time() - cached_time < _XML_CACHE_TTL:
+                return cached_dict
 
-    if len(_xml_cache) >= _XML_CACHE_MAX:
-        oldest_key = min(_xml_cache, key=lambda k: _xml_cache[k][0])
-        del _xml_cache[oldest_key]
-    _xml_cache[rcept_no] = (now, xml_content)
-    return xml_content
+        _rate_limit_api()
+        url = f"{DART_API_BASE}/document.xml"
+        resp = requests.get(url, params={"crtfc_key": API_KEY, "rcept_no": rcept_no}, timeout=60)
+        resp.raise_for_status()
+        z = zipfile.ZipFile(io.BytesIO(resp.content))
+
+        docs = {}
+        for name in z.namelist():
+            content = z.read(name).decode("utf-8", errors="replace")
+            m = re.search(r"<DOCUMENT-NAME[^>]*>([^<]+)</DOCUMENT-NAME>", content)
+            doc_name = m.group(1).strip() if m else name
+            # 같은 doc_name이 둘 이상이면 첫 번째만 유지 (드물지만 방어)
+            if doc_name not in docs:
+                docs[doc_name] = content
+
+        if len(_xml_cache) >= _XML_CACHE_MAX:
+            oldest_key = min(_xml_cache, key=lambda k: _xml_cache[k][0])
+            del _xml_cache[oldest_key]
+        _xml_cache[rcept_no] = (time.time(), docs)
+        return docs
+
+
+def _download_document_xml(rcept_no):
+    """기존 호환성: 메인 보고서 XML을 반환 (사업/분기/반기 보고서 우선)."""
+    docs = _download_filing_documents(rcept_no)
+    for key in ("사업보고서", "분기보고서", "반기보고서", "감사보고서", "연결감사보고서"):
+        if key in docs:
+            return docs[key]
+    # 폴백: dict의 첫 번째 항목
+    if docs:
+        return next(iter(docs.values()))
+    return ""
 
 
 AUDITOR_PATTERNS = [
@@ -452,45 +496,44 @@ def _extract_section_html(xml_content, sections, section_index):
 
 # ── 감사보고서 본문 추출 ──
 
-def _extract_audit_section_text(xml_content):
-    """XML에서 감사보고서/연결감사보고서 섹션의 텍스트만 분리 추출한다."""
-    sections = _extract_sections_from_xml(xml_content)
-
-    audit_html_chunks = []
-    consolidated_html_chunks = []
-
-    for sec in sections:
-        title_clean = sec["title"].replace(" ", "")
-        if "연결감사보고서" in title_clean:
-            consolidated_html_chunks.append(_extract_section_html(xml_content, sections, sec["index"]))
-        elif "감사보고서" in title_clean and "내부회계" not in title_clean and "감사의감사" not in title_clean:
-            audit_html_chunks.append(_extract_section_html(xml_content, sections, sec["index"]))
-
-    def _to_text(chunks):
-        if not chunks:
-            return ""
-        joined = " ".join(chunks)
-        # 태그 제거 → 공백 정규화
-        text = re.sub(r"<[^>]+>", " ", joined)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
-    return {
-        "audit": _to_text(audit_html_chunks),
-        "consolidated": _to_text(consolidated_html_chunks),
-    }
+def _xml_to_plaintext(xml_content):
+    """XML에서 모든 태그를 제거하고 공백 정규화한 텍스트 반환."""
+    if not xml_content:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", xml_content)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def _get_audit_text(rcept_no):
-    """감사/연결감사 섹션 텍스트를 캐시 사용해 반환."""
+    """rcept_no에 해당하는 (감사보고서|연결감사보고서) 첨부 XML의 본문 텍스트를 반환.
+
+    OpenDART document.xml zip 안에는 사업보고서/감사보고서/연결감사보고서가 별도 XML 파일로 들어 있다.
+    DOCUMENT-NAME 메타데이터로 분류해 감사보고서·연결감사보고서 본문 텍스트만 추출한다.
+
+    외부감사(F) 단독 공시인 경우 zip 안에 '감사보고서' 또는 '연결감사보고서' 한 종류만 있을 수 있음.
+    그 경우 해당 XML 자체가 본문이므로 그대로 사용한다.
+    """
     if rcept_no in _audit_text_cache:
         return _audit_text_cache[rcept_no]
+
+    result = {"audit": "", "consolidated": ""}
     try:
-        xml_content = _download_document_xml(rcept_no)
-        result = _extract_audit_section_text(xml_content)
+        docs = _download_filing_documents(rcept_no)
+        # DOCUMENT-NAME 정확 매칭
+        if "감사보고서" in docs:
+            result["audit"] = _xml_to_plaintext(docs["감사보고서"])
+        if "연결감사보고서" in docs:
+            result["consolidated"] = _xml_to_plaintext(docs["연결감사보고서"])
+
+        # 메인 보고서가 자체 감사·연결감사보고서인 경우(외부감사 단독 공시)
+        # 이미 위에서 매칭됐으면 추가 작업 불필요
+        if not result["audit"] and not result["consolidated"]:
+            # 사업보고서/분기보고서 등이지만 첨부 감사보고서가 없는 경우 → 빈 결과 유지
+            # (해당 공시는 audit_only 매칭 시 자동으로 탈락)
+            pass
     except Exception as exc:
         logger.warning("감사보고서 본문 추출 실패 (rcept_no=%s): %s", rcept_no, exc)
-        result = {"audit": "", "consolidated": ""}
 
     if len(_audit_text_cache) >= _AUDIT_TEXT_CACHE_MAX:
         _audit_text_cache.pop(next(iter(_audit_text_cache)))
@@ -787,12 +830,15 @@ def extract_auditor_single(rcept_no):
     return jsonify({"rcept_no": rcept_no, "auditor": auditor})
 
 
-@app.route("/api/check-audit-content", methods=["POST"])
-def check_audit_content():
-    """주어진 키워드들이 (감사보고서|연결감사보고서) 섹션 본문에 모두 포함되는지 검증."""
+@app.route("/api/analyze-filings", methods=["POST"])
+def analyze_filings():
+    """rcept_no별로 auditor + (선택적) audit-section keyword 검증을 한 번에 반환.
+    XML이 캐시에 한 번만 다운로드되므로 OpenDART 호출 횟수가 절반으로 줄어든다.
+    """
     body = flask_request.get_json(silent=True) or {}
     rcept_nos = body.get("rcept_nos", [])
     keywords = body.get("keywords", [])
+    want_audit_check = bool(body.get("audit_check", False)) or (isinstance(keywords, list) and len(keywords) > 0)
 
     if not rcept_nos or not isinstance(rcept_nos, list):
         return jsonify({"error": "rcept_nos 배열이 필요합니다."}), 400
@@ -802,32 +848,47 @@ def check_audit_content():
     rcept_nos = rcept_nos[:20]
     keywords = [str(k).strip() for k in keywords if str(k).strip()]
 
+    def _all_in(text, kws):
+        if not kws:
+            return bool(text)
+        tl = text.lower()
+        return all(kw.lower() in tl for kw in kws)
+
     result = {}
     for rcept_no in rcept_nos:
         rcept_str = str(rcept_no)
         if not rcept_str.isdigit():
             continue
-        text_dict = _get_audit_text(rcept_str)
-        audit_text = text_dict.get("audit", "")
-        consol_text = text_dict.get("consolidated", "")
+        entry = {"auditor": "", "audit_check": None}
+        try:
+            entry["auditor"] = _extract_auditor(rcept_str)
+        except Exception as exc:
+            logger.warning("analyze auditor 실패 (%s): %s", rcept_str, exc)
+            entry["auditor"] = ""
 
-        # 키워드 모두 포함 여부 (대소문자 무시)
-        def _all_in(text, kws):
-            if not kws:
-                return bool(text)
-            tl = text.lower()
-            return all(kw.lower() in tl for kw in kws)
+        if want_audit_check:
+            try:
+                text_dict = _get_audit_text(rcept_str)
+                audit_text = text_dict.get("audit", "")
+                consol_text = text_dict.get("consolidated", "")
+                in_audit = _all_in(audit_text, keywords) if audit_text else False
+                in_consolidated = _all_in(consol_text, keywords) if consol_text else False
+                entry["audit_check"] = {
+                    "in_audit": in_audit,
+                    "in_consolidated": in_consolidated,
+                    "matched": in_audit or in_consolidated,
+                    "has_audit_section": bool(audit_text),
+                    "has_consolidated_section": bool(consol_text),
+                }
+            except Exception as exc:
+                logger.warning("analyze audit_check 실패 (%s): %s", rcept_str, exc)
+                entry["audit_check"] = {
+                    "in_audit": False, "in_consolidated": False, "matched": False,
+                    "has_audit_section": False, "has_consolidated_section": False,
+                    "error": True,
+                }
 
-        in_audit = _all_in(audit_text, keywords) if audit_text else False
-        in_consolidated = _all_in(consol_text, keywords) if consol_text else False
-
-        result[rcept_str] = {
-            "in_audit": in_audit,
-            "in_consolidated": in_consolidated,
-            "matched": in_audit or in_consolidated,
-            "has_audit_section": bool(audit_text),
-            "has_consolidated_section": bool(consol_text),
-        }
+        result[rcept_str] = entry
 
     return jsonify({"results": result})
 
