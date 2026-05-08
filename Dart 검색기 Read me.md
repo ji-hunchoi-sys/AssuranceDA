@@ -86,15 +86,15 @@ python app.py
 .
 ├── app.py                                     # Flask 백엔드 (검색·감사인 추출·문서 조회·통합 분석)
 ├── index_pdf.html                             # DART 검색기 UI (단일 페이지, Vanilla JS)
-├── index2_pdf.html                            # 자금일보 검증기 UI (별도 도구 — 자금일보 검증기.md 참고)
+├── index2_pdf.html                            # 자금일보 검증기 UI (별도 도구 — 자금일보 검증기 Read me.md 참고)
 ├── requirements.txt                           # Python 의존성
 ├── .env.example                               # 환경변수 템플릿
 ├── PRD.md                                     # 제품 요구사항 정의서 (상세 명세)
 ├── AI_RECOMMENDATION.md                       # 개선 제안 메모
-├── 자금일보 검증기.md                          # 자매 도구(자금일보 검증기) 문서
+├── 자금일보 검증기 Read me.md                          # 자매 도구(자금일보 검증기) 문서
 ├── Dart 검색기_감사인필터_제출본 캡쳐1.png    # 스크린샷 (키워드+회사+감사인 필터)
 ├── Dart 검색기_감사인필터_제출본 캡쳐2.png    # 스크린샷 (감사본문 한정 + 회차별 스캔)
-└── README.md
+└── Dart 검색기 Read me.md                     # 본 문서
 ```
 
 ---
@@ -103,4 +103,4 @@ python app.py
 
 - 상세 요구사항·화면 설계·아키텍처는 [`PRD.md`](./PRD.md) 참고
 - 본 도구는 DART OpenAPI 이용약관을 준수하며, 과도한 호출을 막기 위해 요청 간 0.35초 간격의 rate limiting 을 적용합니다.
-- 자금일보 검증기는 [`자금일보 검증기.md`](./자금일보%20검증기.md) 참고.
+- 자금일보 검증기는 [`자금일보 검증기 Read me.md`](./자금일보%20검증기%20Read%20me.md) 참고.
